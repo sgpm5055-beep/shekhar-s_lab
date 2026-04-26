@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "app/api/battle/route.ts": { "maxDuration": 300 },
+    "app/api/orchestrate/route.ts": { "maxDuration": 300 }
+  }
+}

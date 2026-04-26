@@ -1,26 +1,108 @@
 @import "tailwindcss";
 
+/* ─── Design Tokens ─────────────────────────────────────────── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg:    #09090B;
+  --s1:    rgba(255, 255, 255, 0.03);
+  --s2:    rgba(255, 255, 255, 0.06);
+  --glass: rgba(255, 255, 255, 0.04);
+  --b1:    rgba(255, 255, 255, 0.07);
+  --t0: #FAFAFA;
+  --t1: #D4D4D8;
+  --t2: #A1A1AA;
+  --t3: #71717A;
+  --t4: #3F3F46;
+  --claude:     #F59E0B;
+  --gpt:        #10B981;
+  --judge:      #A78BFA;
+  --supervisor: #F59E0B;
+  --researcher: #3B82F6;
+  --writer:     #10B981;
+  --critic:     #EF4444;
+  --tool:       #818CF8;
+  --display: var(--font-display, 'Instrument Sans', sans-serif);
+  --mono:    var(--font-mono, 'Geist Mono', monospace);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+@theme {
+  --color-bg:         #09090B;
+  --color-claude:     #F59E0B;
+  --color-gpt:        #10B981;
+  --color-judge:      #A78BFA;
+  --color-researcher: #3B82F6;
+  --color-writer:     #10B981;
+  --color-critic:     #EF4444;
+  --color-tool:       #818CF8;
+  --color-t0: #FAFAFA;
+  --color-t1: #D4D4D8;
+  --color-t2: #A1A1AA;
+  --color-t3: #71717A;
+  --color-t4: #3F3F46;
+  --font-family-display: 'Instrument Sans', sans-serif;
+  --font-family-mono:    'Geist Mono', monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* ─── Reset ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--t1);
+  font-family: var(--display);
+  font-size: 14px;
+  line-height: 1.72;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* ─── Glass utilities ────────────────────────────────────────── */
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--b1);
+  border-radius: 14px;
 }
+.glass-intense {
+  background: rgba(255,255,255,0.06);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--b1);
+  border-radius: 14px;
+}
+.glass-subtle {
+  background: var(--s1);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--b1);
+  border-radius: 10px;
+}
+
+/* ─── Scrollbar ──────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--s2); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.10); }
+
+/* ─── Animations ─────────────────────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(1.5); }
+}
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 0 0 currentColor; }
+  50%       { box-shadow: 0 0 16px 2px currentColor; }
+}
+
+.anim-fade-up   { animation: fadeUp  0.5s cubic-bezier(.4,0,.2,1) both; }
+.anim-slide-in  { animation: slideIn 0.3s cubic-bezier(.4,0,.2,1) both; }
+.anim-pulse-dot { animation: pulseDot 1.5s ease infinite; }
