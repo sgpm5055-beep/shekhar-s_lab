@@ -416,6 +416,18 @@ def test_terminal_patch_applies_while_running() -> None:
     assert got.pan_hash == PAN_A  # untouched fields survive
 
 
+def test_terminal_patch_carries_is_refresh() -> None:
+    # K4 vs K10 (Task 11): the row is inserted at admission step 1.5, BEFORE the decision that knows is_refresh, so the
+    # flag rides on the ONE guarded terminal patch (never a separate update).
+    repo = MemoryRepo(FrozenClock())
+    repo.insert_check(make_check())
+    patch: CheckPatch = {"status": "ok", "code": None, "is_refresh": True}
+    repo.update_check("chk-1", patch)
+    got = repo.get_check("chk-1")
+    assert got is not None
+    assert got.is_refresh is True
+
+
 @pytest.mark.parametrize("status", [s for s in ALL_STATUSES if s != "running"])
 def test_terminal_guard_makes_every_non_running_row_immutable_to_terminal_patches(status: str) -> None:
     repo = MemoryRepo(FrozenClock())

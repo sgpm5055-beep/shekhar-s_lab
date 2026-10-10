@@ -390,6 +390,7 @@ class CheckState(TypedDict, total=False):
     refresh: bool
     acknowledge_ntc_warning: bool
     consent: ConsentInfo | None
+    consent_id: str | None  # this run's consents row (admission step 1); None on CONSENT_MISSING and on recompute
     is_recompute: bool
     # admission
     admission: AdmissionDecision | None
@@ -418,6 +419,8 @@ class CheckState(TypedDict, total=False):
     surepass_calls_made: Annotated[list[SurePassCallAudit], operator.add]
     bureau_called: bool
     pan_called: bool
+    billed: bool  # persist / persist_refusal: policy.compute_billed over this check's call rows (tracing reads it)
+    counted_against_quota: bool  # persist: policy.compute_counted_against_quota (tracing reads it)
     langsmith_run_id: str | None
     errors: Annotated[list[str], operator.add]
     transcript: Annotated[list[str], operator.add]  # node names in order; -> checks.internal

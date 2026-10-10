@@ -494,11 +494,12 @@ RecomputeOutcome = Literal["ok", "not_found", "not_recomputable", "raw_unavailab
 def admit_recompute(
     check_status: str | None,
     check_code: str | None,
-    kind: Kind,
+    kind: Kind | None,
     pan_row_present: bool,
     bureau_row_present: bool,
 ) -> RecomputeOutcome:
-    """POST /checks/{check_id}/recompute. ``check_status`` None means ``repo.get_check`` found nothing.
+    """POST /checks/{check_id}/recompute. ``check_status`` None means ``repo.get_check`` found nothing (and ``kind`` is
+    then None too: a missing check has no kind, so R1 never needs a dummy one; Task 11 widening, ruling 12).
 
     | R1 | check missing (check_status is None)                                  -> 'not_found' (API 404) |
     | R2 | status != 'ok' and not (status == 'service_failure' and code == 'OPENAI_FAILURE')

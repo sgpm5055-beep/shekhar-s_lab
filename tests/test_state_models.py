@@ -730,10 +730,11 @@ def test_state_update_alias_is_a_dict() -> None:
 # --------------------------------------------------------------------------- CheckState (typing-only asserts)
 
 
-def test_check_state_is_total_false_with_required_keys() -> None:
+def test_check_state_is_total_false_with_exactly_the_registered_keys() -> None:
+    # Set-equality (Task 1 deferral, closed in Task 11): a key cannot be added or dropped without this list changing.
     assert CheckState.__total__ is False
     hints = get_type_hints(CheckState, include_extras=True)
-    for key in (
+    expected = {
         "kind",
         "check_id",
         "lc_id",
@@ -752,6 +753,7 @@ def test_check_state_is_total_false_with_required_keys() -> None:
         "refresh",
         "acknowledge_ntc_warning",
         "consent",
+        "consent_id",
         "is_recompute",
         "admission",
         "identity",
@@ -775,11 +777,13 @@ def test_check_state_is_total_false_with_required_keys() -> None:
         "surepass_calls_made",
         "bureau_called",
         "pan_called",
+        "billed",
+        "counted_against_quota",
         "langsmith_run_id",
         "errors",
         "transcript",
-    ):
-        assert key in hints, key
+    }
+    assert set(hints) == expected
     assert "gender" not in hints
 
 
@@ -793,6 +797,9 @@ def test_check_state_amended_key_types() -> None:
     assert hints["consent"] == (ConsentInfo | None)
     assert hints["rank_attempts"] is int
     assert hints["rank_error"] == (str | None)
+    assert hints["consent_id"] == (str | None)  # this run's consent row (None on CONSENT_MISSING / recompute)
+    assert hints["billed"] is bool  # written by persist / persist_refusal (policy.compute_billed)
+    assert hints["counted_against_quota"] is bool  # written by persist (policy.compute_counted_against_quota)
 
 
 def test_check_state_reducers_use_operator_add() -> None:

@@ -1120,6 +1120,8 @@ def test_evaluate_pan_change_does_not_mutate_its_input() -> None:
     [
         pytest.param(None, None, "quick", True, True, "not_found", id="R1-missing-check"),
         pytest.param(None, None, "full", False, False, "not_found", id="R1-missing-check-beats-everything"),
+        # T11 (ruling 12): a missing check has no kind, so R1 takes None rather than a dummy kind.
+        pytest.param(None, None, None, False, False, "not_found", id="R1-missing-check-no-kind"),
         pytest.param("ok", None, "quick", True, True, "ok", id="R5-ok-quick"),
         pytest.param("ok", None, "full", True, True, "ok", id="R5-ok-full"),
         pytest.param("ok", "NO_PINCODE_ON_PAN", "quick", True, True, "ok", id="R5-ok-no-pincode-code"),
@@ -1144,7 +1146,7 @@ def test_evaluate_pan_change_does_not_mutate_its_input() -> None:
     ],
 )
 def test_admit_recompute_table(
-    status: str | None, code: str | None, kind: Kind, pan_row: bool, bureau_row: bool, expected: str
+    status: str | None, code: str | None, kind: Kind | None, pan_row: bool, bureau_row: bool, expected: str
 ) -> None:
     assert admit_recompute(status, code, kind, pan_row, bureau_row) == expected
 

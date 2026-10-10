@@ -213,6 +213,9 @@ class CheckPatch(TypedDict, total=False):
     code: Code | None
     billed: bool
     counted_against_quota: bool
+    # K4 says is_refresh is set at insert_check, but K10 inserts the row at admission step 1.5, BEFORE the decision that
+    # knows it; so persist carries it on the ONE guarded terminal patch (Task 11). consent_id stays insert-only.
+    is_refresh: bool
     contact_id: str | None
     lc_view: dict[str, Any] | None
     internal: dict[str, Any] | None
