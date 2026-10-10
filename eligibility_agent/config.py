@@ -46,7 +46,12 @@ def utcnow() -> datetime:
 class Settings(BaseSettings):
     """Every env var the service reads. Init kwargs and env both use the env name (the ``validation_alias``)."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+    # env_ignore_empty: docker-compose / PaaS passthrough (`FOO=${FOO}`) and `VAR=` lines left in a .env inject ""
+    # for unset vars. Blank means unset in BOTH the env and dotenv sources, so the field default applies (a blank
+    # GRAPH_TIMEOUT_SECONDS / REPO_BACKEND would otherwise crash Settings() before startup_errors() can run, and a
+    # blank optional would become "" instead of None). It does not apply to init kwargs, hence the blank checks
+    # kept in ``auth_enabled`` / ``startup_errors`` below.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False, env_ignore_empty=True)
 
     # SurePass. Live iff SUREPASS_LIVE is EXACTLY "true" (see ``surepass_live``); anything else is the stub.
     surepass_live_flag: str = Field(default="", validation_alias="SUREPASS_LIVE")

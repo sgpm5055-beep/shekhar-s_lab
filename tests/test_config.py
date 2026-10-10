@@ -105,6 +105,60 @@ def test_default_env_file_lookup_is_optional(
     assert s.startup_errors() == []
 
 
+# Blank env values (docker-compose / PaaS passthrough `FOO=${FOO}` injects "" for unset vars) are "unset":
+# they must fall back to the field default, never crash Settings() and never become "" where None is expected.
+def test_blank_env_vars_fall_back_to_defaults_and_never_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _aliases():
+        monkeypatch.setenv(name, "")
+    s = make()
+    assert s.startup_errors() == []
+    assert s.graph_timeout_seconds == 90.0  # blank float would otherwise be a ValidationError
+    assert s.repo_backend == "memory"  # blank Literal would otherwise be a ValidationError
+    assert s.prompt_source == "local"
+    assert s.surepass_live is False and s.langsmith_tracing is False and s.auth_enabled is False
+    assert s.raw_bucket == "raw-responses"
+    assert s.surepass_base_url == "https://kyc-api.surepass.app"
+    assert s.log_level == "INFO"
+    assert s.openai_model == "gpt-4.1" and s.langsmith_project == "eligibility-agent"
+    assert s.identity_hmac_key == DEFAULT_DEV_HMAC_KEY
+    for optional in (
+        s.surepass_token,
+        s.service_api_token,
+        s.supabase_url,
+        s.supabase_service_role_key,
+        s.database_url,
+        s.openai_api_key,
+        s.langsmith_api_key,
+        s.prompt_tag,
+    ):
+        assert optional is None  # blank must be None, so downstream `is None` checks stay correct
+
+
+@pytest.mark.parametrize("name", ["GRAPH_TIMEOUT_SECONDS", "REPO_BACKEND", "PROMPT_SOURCE"])
+def test_blank_typed_env_var_does_not_raise_validation_error(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(name, "")
+    assert make().startup_errors() == []
+
+
+def test_blank_identity_hmac_key_env_is_caught_by_the_non_default_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {**SUPABASE_FULL, "IDENTITY_HMAC_KEY": ""}.items():
+        monkeypatch.setenv(name, value)
+    s = make()
+    assert s.identity_hmac_key == DEFAULT_DEV_HMAC_KEY  # blank -> dev default ...
+    errors = s.startup_errors()
+    assert len(errors) == 1 and "IDENTITY_HMAC_KEY" in errors[0]  # ... which supabase refuses
+
+
+def test_blank_values_in_dotenv_file_are_ignored_too(tmp_path: Path) -> None:
+    # `cp .env.example .env` then uncommenting lines leaves `VAR=` blanks; the dotenv source honours the same rule.
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("GRAPH_TIMEOUT_SECONDS=\nREPO_BACKEND=\nOPENAI_API_KEY=\nRAW_BUCKET=\nSERVICE_API_TOKEN=\n")
+    s = cast(Any, Settings)(_env_file=dotenv)
+    assert (s.graph_timeout_seconds, s.repo_backend, s.raw_bucket) == (90.0, "memory", "raw-responses")
+    assert s.openai_api_key is None and s.service_api_token is None and s.auth_enabled is False
+    assert s.startup_errors() == []
+
+
 # 2. Kill switch: live iff the value is EXACTLY the lowercase literal "true".
 @pytest.mark.parametrize(("value", "expected"), [("true", True), ("True", False), ("TRUE", False), ("1", False), ("yes", False), ("", False), (" true", False), ("true ", False)])
 def test_surepass_live_is_exact_literal(value: str, expected: bool) -> None:
