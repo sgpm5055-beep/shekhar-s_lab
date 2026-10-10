@@ -8,8 +8,9 @@ import operator
 import re
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, get_args, get_type_hints
+from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -371,10 +372,97 @@ def test_pick_rejects_extra_fields() -> None:
         Pick.model_validate(payload)
 
 
-def test_model_output_has_no_numeric_money_or_score_fields() -> None:
-    forbidden = {"ceiling", "score", "lower", "upper", "amount", "loan_max", "emi", "foir"}
-    assert forbidden.isdisjoint(ModelOutput.model_fields)
-    assert forbidden.isdisjoint(Pick.model_fields)
+def _numeric_fields(model: type[BaseModel]) -> set[tuple[str, str, type]]:
+    """Every ``(owning model, field, numeric type)`` reachable from ``model``: int / float / Decimal found anywhere in a
+    field annotation, through unions, containers, ``Annotated`` and nested models. ``Literal`` values and ``bool`` are
+    not numeric types (``bool`` is matched by identity, never by ``issubclass``)."""
+    found: set[tuple[str, str, type]] = set()
+
+    def walk(owner: str, field: str, annotation: object) -> None:
+        origin = get_origin(annotation)
+        if origin is Literal:
+            return
+        if origin is Annotated:
+            walk(owner, field, get_args(annotation)[0])
+            return
+        if origin is not None:
+            for arg in get_args(annotation):
+                walk(owner, field, arg)
+            return
+        if not isinstance(annotation, type):
+            return
+        if issubclass(annotation, BaseModel):
+            for name, info in annotation.model_fields.items():
+                walk(annotation.__name__, name, info.annotation)
+        elif annotation in (int, float, Decimal):
+            found.add((owner, field, annotation))
+
+    for name, info in model.model_fields.items():
+        walk(model.__name__, name, info.annotation)
+    return found
+
+
+def test_the_only_numeric_field_anywhere_in_pick_or_model_output_is_rank() -> None:
+    # Type-based: no money / score / amount field can creep in under ANY name. ``rank`` is ordering metadata.
+    assert _numeric_fields(Pick) == {("Pick", "rank", int)}
+    assert _numeric_fields(ModelOutput) == {("Pick", "rank", int)}  # recommendation + alternates both nest Pick
+
+
+def test_the_numeric_field_walker_is_not_vacuous() -> None:
+    class _Planted(BaseModel):
+        ok_flag: bool
+        nested: list[Pick]
+        ceiling: Annotated[float, "money"] | None
+        amounts: dict[str, Decimal]
+
+    assert _numeric_fields(_Planted) == {
+        ("Pick", "rank", int),
+        ("_Planted", "ceiling", float),
+        ("_Planted", "amounts", Decimal),
+    }
+
+
+def test_wire_model_field_names_are_the_frozen_client_contract() -> None:
+    # PRD v1.1 section 6: these names ARE the client contract. Any rename / addition / removal must fail here first.
+    assert set(LoanRange.model_fields.keys()) == {"lower", "upper"}
+    assert set(LenderView.model_fields.keys()) == {
+        "id",
+        "name",
+        "rate_band",
+        "tenure_range",
+        "ceiling",
+        "range",
+        "rationale",
+        "conditions",
+    }
+    assert set(LcView.model_fields.keys()) == {
+        "check_id",
+        "kind",
+        "status",
+        "code",
+        "headline",
+        "label",
+        "confidence",
+        "top_lender",
+        "alternates",
+        "coapplicant_suggested",
+        "coapplicant_reason",
+        "pan_aadhaar_link_warning",
+        "items_to_confirm",
+        "checked_on",
+        "from_cache",
+        "refresh_available_on",
+        "quick_checks_left_today",
+    }
+    assert set(Pick.model_fields.keys()) == {"lender_id", "rank", "rationale", "conditions"}
+    assert set(ModelOutput.model_fields.keys()) == {
+        "recommendation",
+        "alternates",
+        "confidence",
+        "co_applicant_suggested",
+        "co_applicant_reason",
+        "review_flags",
+    }
 
 
 # --------------------------------------------------------------------------- 3. consent / identity / LcView
@@ -382,9 +470,11 @@ def test_model_output_has_no_numeric_money_or_score_fields() -> None:
 
 def test_consent_info_given_must_be_literally_true() -> None:
     payload = _consent().model_dump(mode="json")
-    for bad in (False, 1, "true", None):
+    # Literal[True] alone would admit 1 and 1.0 (they equal True); the before-validator demands the bool itself.
+    for bad in (False, 1, 1.0, 0, 0.0, "true", "True", "1", None):
         with pytest.raises(ValidationError):
             ConsentInfo.model_validate({**payload, "given": bad})
+    assert ConsentInfo.model_validate({**payload, "given": True}).given is True
 
 
 def test_identity_has_no_gender() -> None:
