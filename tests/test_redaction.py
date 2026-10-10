@@ -399,7 +399,11 @@ def test_every_reserved_default_ignorable_code_point_is_invisible_to_the_scan() 
 # --------------------------------------------------------------------------- bounded backtracking (fix round 1)
 
 
-HOSTILE_INPUTS: dict[str, str] = {
+# Regex-shape pins. Every input here is longer than MAX_PROSE_LINE_CHARS, so the LLM-prose tier would drop it on length
+# alone without running a single pattern (that is the point of the cap, and it would make these pins vacuous). They are
+# therefore run through the UNCAPPED global tier, which carries the same ACCOUNT_ID_RE / STANDALONE_SCORE_RE and the
+# same normaliser, so each one really exercises the regexes.
+REGEX_SHAPE_INPUTS: dict[str, str] = {
     "padded-gap": "account number" + " " * 40_000,
     "padded-gap-then-text": "account number" + " " * 40_000 + "x",
     "dash-gap": "account no" + "-" * 40_000,
@@ -413,18 +417,34 @@ HOSTILE_INPUTS: dict[str, str] = {
     "repeated-label": "a/c " * 20_000,
     "digit-run": "1" * 100_000,
     "zero-width-run": "\u200b" * 50_000 + "7" + "\u200b" * 50_000,  # the normaliser itself is linear
-    # NFKC reorders combining marks quadratically (80k chars took ~1.6s, x4 per doubling): the LLM-prose tier drops an
-    # over-long line BEFORE normalising, so this must be instant
-    "combining-marks": "a" + "\u0301\u0316" * 40_000,
 }
 
+# NFKC reorders combining marks quadratically (80k chars took ~1.6s, x4 per doubling). THIS pin is about the cap: the
+# LLM-prose tier drops an over-long line BEFORE normalising, so it must be instant on that tier.
+COMBINING_MARKS_LINE: str = "a" + "\u0301\u0316" * 40_000
 
-@pytest.mark.parametrize("name", sorted(HOSTILE_INPUTS))
+
+@pytest.mark.parametrize("name", sorted(REGEX_SHAPE_INPUTS))
 def test_the_account_pattern_does_not_backtrack_quadratically(name: str) -> None:
+    text = REGEX_SHAPE_INPUTS[name]
+    assert len(text) > MAX_PROSE_LINE_CHARS  # why this is the global tier: the LLM tier would never reach the regexes
     started = time.perf_counter()
-    line_leaks(HOSTILE_INPUTS[name], LLM_LEAK_PATTERNS)
+    line_leaks(text, GLOBAL_LEAK_PATTERNS)
     # linear scans finish in milliseconds; each quadratic shape this pins takes tens of seconds at these sizes
     assert time.perf_counter() - started < 1.0
+
+
+def test_an_80k_combining_mark_line_is_dropped_by_the_length_cap_not_scanned() -> None:
+    assert len(COMBINING_MARKS_LINE) > MAX_PROSE_LINE_CHARS  # the cap, not the normaliser, is what handles this line
+    started = time.perf_counter()
+    assert line_leaks(COMBINING_MARKS_LINE, LLM_LEAK_PATTERNS) is True
+    assert time.perf_counter() - started < 1.0
+
+
+def test_the_regex_shape_inputs_really_are_dropped_by_the_cap_on_the_llm_tier() -> None:
+    # records why the pins above use the global tier: on the LLM tier every one of them is a length-cap drop
+    for name, text in REGEX_SHAPE_INPUTS.items():
+        assert line_leaks(text, LLM_LEAK_PATTERNS) is True, name
 
 
 # --------------------------------------------------------------------------- prose-line length cap (fix round 3, ruled)
