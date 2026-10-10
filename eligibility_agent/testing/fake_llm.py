@@ -144,7 +144,8 @@ def below_floor_pick() -> Responder:
 
     def respond(ctx: RankContext) -> ModelOutput:
         below = [lender.lender_id for lender in ctx.lenders if lender.band_clears_floor is False]
-        assert below, "below_floor_pick needs a gated lender whose floor the band does not clear"
+        if not below:
+            raise AssertionError("below_floor_pick needs a gated lender whose floor the band does not clear")
         return ranked_output(*below[: 1 + _MAX_ALTERNATES], confidence=ctx.code_confidence)
 
     return respond
@@ -154,13 +155,13 @@ def raised_confidence(level: Confidence = "high") -> Responder:
     """Responder: the default ranking, but with a confidence HIGHER than the code's (a model that ignores rule 4).
 
     ``final_confidence`` is ``min(code, model)``, so this changes nothing downstream (the "raise ignored" pin). Raises
-    ``AssertionError`` when ``level`` is not strictly above the code confidence (nothing was raised).
+    ``AssertionError`` (an explicit raise, so it survives ``python -O``) when ``level`` is not strictly above the code
+    confidence (nothing was raised).
     """
 
     def respond(ctx: RankContext) -> ModelOutput:
-        assert CONFIDENCE_ORDER[level] > CONFIDENCE_ORDER[ctx.code_confidence], (
-            f"cannot raise confidence to {level!r} above the code's {ctx.code_confidence!r}"
-        )
+        if CONFIDENCE_ORDER[level] <= CONFIDENCE_ORDER[ctx.code_confidence]:
+            raise AssertionError(f"cannot raise confidence to {level!r} above the code's {ctx.code_confidence!r}")
         return default_ranking(ctx).model_copy(update={"confidence": level})
 
     return respond
@@ -170,9 +171,8 @@ def lowered_confidence(level: Confidence = "low") -> Responder:
     """Responder: the default ranking with a confidence strictly LOWER than the code's (the permitted direction)."""
 
     def respond(ctx: RankContext) -> ModelOutput:
-        assert CONFIDENCE_ORDER[level] < CONFIDENCE_ORDER[ctx.code_confidence], (
-            f"cannot lower confidence to {level!r} from the code's {ctx.code_confidence!r}"
-        )
+        if CONFIDENCE_ORDER[level] >= CONFIDENCE_ORDER[ctx.code_confidence]:
+            raise AssertionError(f"cannot lower confidence to {level!r} from the code's {ctx.code_confidence!r}")
         return default_ranking(ctx).model_copy(update={"confidence": level})
 
     return respond

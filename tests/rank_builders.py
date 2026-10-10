@@ -13,6 +13,7 @@ from datetime import date
 from typing import Any, Final, cast
 
 from eligibility_agent.graph.state import (
+    AdmissionDecision,
     Band,
     CheckState,
     Confidence,
@@ -28,6 +29,7 @@ from eligibility_agent.graph.state import (
     OpenAccount,
     ReportFacts,
     ScoreFacts,
+    SurePassCallAudit,
 )
 
 PAN: Final[str] = "QZXPL4826M"
@@ -40,6 +42,16 @@ SCORE_NUMBER: Final[int] = 767
 DOB: Final[date] = date(1994, 7, 21)
 LENDER_DISPLAY_NAME: Final[str] = "Zenith Finserv Pvt Ltd"
 CLIENT_ID: Final[str] = "kyc_client_zq81tw"
+CONSENT_ID: Final[str] = "consent-zq-0042"
+WARNING_LENDER: Final[str] = "zq-lender-warn"
+BUREAU_ENDPOINT: Final[str] = "/api/v1/credit-report-experian/score"
+
+# Bureau names are never allowed to reach the model (nor an LC). The poisoned state below carries every one of them in
+# fields the rank seam must not read (a gate warning, an error line, a SurePass call audit endpoint), and the scans are
+# case-insensitive.
+BUREAU_NAMES: Final[tuple[str, ...]] = ("experian", "cibil", "equifax", "crif", "transunion", "highmark")
+GATE_WARNING: Final[str] = f"lender {WARNING_LENDER} excluded: missing score_floor (CIBIL cutoff, Equifax and CRIF unknown)"
+ERROR_LINE: Final[str] = "Highmark and TransUnion lookups skipped; zq-error-line"
 
 # Every literal below is planted in a state field the rank seam must not read. (The score's digits are checked as a
 # bare substring on purpose: the fixtures' own numbers are chosen so that none of them contains 767.)
@@ -70,6 +82,10 @@ POISON: Final[tuple[str, ...]] = (
     "Zenith",
     "acct_0",
     "acct_1",
+    CONSENT_ID,
+    WARNING_LENDER,
+    "zq-error-line",
+    "credit-report-experian",
 )
 
 
@@ -296,6 +312,24 @@ def make_state(
         "code_confidence": code_confidence,
         "rank_attempts": 0,
         "rank_error": None,
+        # bookkeeping the rank seam must never read: gate warnings, the SurePass call audit (client id, bureau endpoint),
+        # the admission decision (consent id), the accumulated error lines.
+        "gate_warnings": [GATE_WARNING],
+        "surepass_calls_made": [
+            SurePassCallAudit(
+                endpoint=BUREAU_ENDPOINT, http_status=200, success=True, message_code="success", client_id=CLIENT_ID, billed=True
+            )
+        ],
+        "admission": AdmissionDecision(
+            admission="new",
+            pan_plan="call",
+            bureau_plan="call",
+            counts_against_quota=True,
+            quota_used_today=2,
+            quota_limit=5,
+            original_consent_id=CONSENT_ID,
+        ),
+        "errors": [ERROR_LINE],
     }
     if kind == "full":
         state["report"] = report_facts(band=band, score=score_number, is_ntc=band == "NTC")

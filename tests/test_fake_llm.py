@@ -12,19 +12,31 @@ a context built from a poisoned state is independent of every poisoned value.
 
 from __future__ import annotations
 
+import ast
 import inspect
 from collections.abc import Callable
+from pathlib import Path
 from datetime import date
 from typing import Any, Final, cast, get_args
 
 import pytest
 from langchain_core.runnables import RunnableConfig
 from pydantic import ValidationError
-from rank_builders import POISON, gated_of, gl, make_state, num, numbers_of, open_account
+from rank_builders import BUREAU_NAMES, POISON, gated_of, gl, make_state, num, numbers_of, open_account
 from rank_builders import identity as make_identity
 
 from eligibility_agent.graph.llm import LenderContext, RankContext, RankModel, build_rank_context
-from eligibility_agent.graph.state import Band, CheckState, Confidence, ConsentInfo, Kind, ModelOutput, ScoreFacts
+from eligibility_agent.graph.state import (
+    AdmissionDecision,
+    Band,
+    CheckState,
+    Confidence,
+    ConsentInfo,
+    Kind,
+    ModelOutput,
+    ScoreFacts,
+    SurePassCallAudit,
+)
 from eligibility_agent.lenders.safety import final_confidence, run_safety
 from eligibility_agent.output.lc_view import scrub_lines
 from eligibility_agent.testing.fake_llm import (
@@ -236,6 +248,15 @@ def test_below_floor_pick_skips_lenders_that_do_clear_the_floor() -> None:
     assert [p.lender_id for p in (out.recommendation, *out.alternates) if p is not None] == ["L2"]
 
 
+FAKE_LLM_PY: Final[Path] = Path(__file__).resolve().parent.parent / "eligibility_agent" / "testing" / "fake_llm.py"
+
+
+def test_the_anti_vacuity_guards_are_raises_not_asserts_so_they_survive_python_dash_o() -> None:
+    # ``python -O`` strips ``assert`` statements: a guard written as one would silently stop guarding.
+    tree = ast.parse(FAKE_LLM_PY.read_text())
+    assert [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)] == []
+
+
 def test_below_floor_pick_without_a_below_floor_lender_is_a_setup_error() -> None:
     with pytest.raises(AssertionError, match="below"):
         below_floor_pick()(ctx_for())
@@ -411,12 +432,19 @@ def test_a_context_built_from_a_poisoned_state_carries_no_poison_anywhere(rank_a
     identity_json = make_identity().model_dump_json()  # the date of birth is a date object in repr(), a string in JSON
     for literal in POISON:  # the fixture really is poisoned: each literal sits in the state the builder reads from
         assert literal in repr(state) or literal in identity_json, literal
+    lowered_state = repr(state).lower()
+    for name in BUREAU_NAMES:  # every bureau name sits in a state field the builder must not read
+        assert name in lowered_state, name
+    for key in ("gate_warnings", "surepass_calls_made", "admission", "errors"):
+        assert state.get(key), key
     ctx = build_rank_context(state)
     dumped = ctx.model_dump_json()
     for literal in POISON:
         assert literal not in dumped, literal
         assert literal not in repr(ctx), literal
         assert literal not in str(ctx), literal
+    for name in BUREAU_NAMES:  # case-insensitive
+        assert name not in dumped.lower() and name not in repr(ctx).lower(), name
     # and the allowed facts did arrive
     assert ctx.band == "720-780" and ctx.declared_income == 60000.0 and [lender.lender_id for lender in ctx.lenders] == ["L1", "L2"]
 
@@ -451,6 +479,14 @@ def test_the_context_is_independent_of_every_poisoned_state_field(kind: Kind) ->
             gated_lenders=[g.model_copy(update={"name": "Another Name Ltd", "matched_pincodes": ["682301"]}) for g in gated_of(state)],
         ),
         "bookkeeping": _replace(state, errors=["x"], transcript=["admission", "derive"], bureau_called=True, pan_called=True),
+        "gate warnings": _replace(state, gate_warnings=["lender other excluded: invalid criteria loan_min"]),
+        "surepass call audit": _replace(
+            state,
+            surepass_calls_made=[
+                SurePassCallAudit(endpoint="/api/v1/pan/pan-comprehensive", http_status=500, success=False, message_code="err", client_id="other", billed=False)
+            ],
+        ),
+        "admission decision": _replace(state, admission=AdmissionDecision(admission="cache_hit", original_consent_id="other-consent")),
     }
     if kind == "full":
         report = state.get("report")
