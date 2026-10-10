@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import re
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -51,12 +52,12 @@ from eligibility_agent.output.lc_view import (
 
 
 def test_bureau_term_re_is_the_binding_v1_pattern() -> None:
-    assert BUREAU_TERM_RE.pattern == r"\b(?:cibil|experian|equifax|crif|bureaus?)\b"
+    assert BUREAU_TERM_RE.pattern == r"\b(?:cibil|experian|equifax|crif|transunion|highmark|bureaus?)\b"
     assert BUREAU_TERM_RE.flags & re.IGNORECASE
 
 
 def test_bureau_name_re_is_names_only() -> None:
-    assert BUREAU_NAME_RE.pattern == r"\b(?:cibil|experian|equifax|crif)\b"
+    assert BUREAU_NAME_RE.pattern == r"\b(?:cibil|experian|equifax|crif|transunion|highmark)\b"
     assert BUREAU_NAME_RE.flags & re.IGNORECASE
 
 
@@ -177,6 +178,19 @@ ACCOUNT_DROP = [
     "xxxx-xxxx-1234",
     "loan 123456789 outstanding",
     "reference 12345678901234567890",  # 20 digits: longer than the dossier's 18 cap must not escape
+    # fix round 1 (1): plural / glued label forms the first tightening let through
+    "account numbers: 12345678",
+    "account numbers 1234, 5678",
+    "account no123",
+    "a/c no123456",
+    # fix round 1 (2): letter / underscore adjacent digit runs (a \b-anchored run lets these escape)
+    "LN00123456789",
+    "acct_123456789",
+    "ID123456789",
+    "123456789abc",
+    # same escape class on the masked-id branch
+    "XXXX1234abc",
+    "xxxx1234_ref",
 ]
 
 ACCOUNT_KEEP = [
@@ -184,6 +198,8 @@ ACCOUNT_KEEP = [
     "two accounts are open",
     "loan up to 12,34,567",
     "account normally serviced",  # 'no' is a word prefix, not the abbreviation
+    "account nothing to add",
+    "account notes attached",
     "the account is in good standing",
     "an account last updated 2026-06-01",
     "emi 21,000 per month",
@@ -203,6 +219,99 @@ def test_account_id_keep_vectors_on_both_tiers(line: str) -> None:
     assert ACCOUNT_ID_RE.search(line) is None
     assert line_leaks(line, LLM_LEAK_PATTERNS) is False
     assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False
+
+
+# --------------------------------------------------------------------------- bureau names (fix round 1, ruled)
+
+BUREAU_NAME_DROP = ["CIBIL", "Experian", "Equifax", "CRIF", "TransUnion", "TRANSUNION", "transunion", "Highmark", "HIGHMARK"]
+
+
+@pytest.mark.parametrize("name", BUREAU_NAME_DROP)
+def test_every_bureau_name_leaks_on_both_tiers(name: str) -> None:
+    for line in (f"{name} says it is fine", f"per {name}.", name):
+        assert line_leaks(line, LLM_LEAK_PATTERNS) is True
+        assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is True
+
+
+@pytest.mark.parametrize("line", ["highmarked", "transunions", "a highmarkable idea", "crifled"])
+def test_bureau_names_are_whole_words_only(line: str) -> None:
+    assert line_leaks(line, LLM_LEAK_PATTERNS) is False
+    assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False
+
+
+# --------------------------------------------------------------------------- normalization (fix round 1, ruled)
+# Every scan runs on an NFKC-normalised copy with invisible characters stripped, so fullwidth, soft-hyphen and
+# zero-width evasions cannot dodge the (unchanged) patterns. Decisions fire on the normalised copy; a line that is KEPT
+# is returned as the ORIGINAL text (nothing here ever rewrites a span: whole-line drop only).
+
+NORMALIZATION_DROP = [
+    "\uff23\uff29\uff22\uff29\uff2c says it is fine",  # fullwidth CIBIL
+    "CI\u00adBIL says it is fine",  # soft hyphen inside a bureau name
+    "Ex\u200bper\u200dian",  # zero-width space / joiner
+    "\uff25\uff58\uff50\uff45\uff52\uff49\uff41\uff4e",  # fullwidth Experian
+    "\uff34\uff52\uff41\uff4e\uff53\uff35\uff4e\uff49\uff4f\uff4e",  # fullwidth TransUnion
+    "High\u200bmark",
+    "Score is 7\u200b3\u200d6",  # zero-width characters inside a score
+    "Score is 7\ufeff36",  # BOM inside a score
+    "Score is 7\u00ad36",
+    "Score is \uff17\uff13\uff16",  # fullwidth digits
+    "account number \uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19",
+    "a/c no: SYN\u200bTH0001",
+    "1234\u200b56789",  # a 9-digit run split by a zero-width space
+]
+
+NORMALIZATION_KEEP = [
+    "EMI of \uff13\uff0c\uff15\uff10\uff10 fits",  # fullwidth '3,500' normalises to a grouped amount
+    "\uff21 clean line",
+    "caf\u00e9 income looks steady",
+    "income\u200b looks steady",
+]
+
+
+@pytest.mark.parametrize("line", NORMALIZATION_DROP)
+def test_normalization_closes_unicode_evasions_on_both_tiers(line: str) -> None:
+    assert line_leaks(line, LLM_LEAK_PATTERNS) is True
+    assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is True
+
+
+@pytest.mark.parametrize("line", NORMALIZATION_KEEP)
+def test_normalization_does_not_over_scrub(line: str) -> None:
+    assert line_leaks(line, LLM_LEAK_PATTERNS) is False
+    assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False
+
+
+def test_the_raw_patterns_are_unchanged_by_normalization() -> None:
+    # the evasions only fail the raw pattern; line_leaks is what closes them
+    assert BUREAU_NAME_RE.search("CI\u00adBIL") is None
+    assert STANDALONE_SCORE_RE.search("7\u200b36") is None
+    assert line_leaks("CI\u00adBIL") is True and line_leaks("7\u200b36") is True
+
+
+def test_kept_lines_are_returned_as_the_original_text() -> None:
+    lines = ["Fine\u200b text", "\uff23\uff29\uff22\uff29\uff2c shows it", "\uff21 clean", "Score is 7\u200b36"]
+    assert scrub_lines(lines) == ["Fine\u200b text", "\uff21 clean"]
+
+
+# --------------------------------------------------------------------------- bounded backtracking (fix round 1)
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "account number" + " " * 100_000,
+        "account number" + " " * 100_000 + "x",
+        "account no" + "-" * 100_000,
+        "*" * 200_000,
+        "x" * 200_000,
+        "*x" * 100_000,
+        "a/c " * 50_000,
+        "1" * 200_000,
+    ],
+)
+def test_the_account_pattern_does_not_backtrack_quadratically(hostile: str) -> None:
+    started = time.perf_counter()
+    line_leaks(hostile, LLM_LEAK_PATTERNS)
+    assert time.perf_counter() - started < 2.0
 
 
 # --------------------------------------------------------------------------- label-tier vectors (the two-tier reason)
@@ -287,6 +396,9 @@ def test_pending_verification_copy_promises_no_time_based_retry() -> None:
     assert "minute" not in MSG_PENDING_VERIFICATION
     assert "try again" not in MSG_PENDING_VERIFICATION
     assert "resolves it" in MSG_PENDING_VERIFICATION
+    # the PAN_LOCKED refusal rides the same K2 gate (reconciliation outlives the lock), so it promises nothing either
+    assert "minute" not in REFUSAL_MESSAGES["PAN_LOCKED"]
+    assert "try again" not in REFUSAL_MESSAGES["PAN_LOCKED"]
 
 
 REFUSAL_CODES: tuple[Code, ...] = (
@@ -316,7 +428,7 @@ def test_refusal_messages_are_the_ruled_verbatim_strings() -> None:
         "STAGE_TOO_EARLY": "A full check unlocks once this opportunity reaches the Offer stage. Until then, use the quick check.",
         "REPORT_WINDOW_OPEN": "This learner's full report is still current. Refresh unlocks once it is 30 days old.",
         "IN_FLIGHT": "A check for this learner is already running. Please wait for it to finish.",
-        "PAN_LOCKED": "This learner's record is locked for a few minutes while an earlier check is reconciled. Please try again shortly.",
+        "PAN_LOCKED": "This learner's PAN is temporarily locked while a previous check on it is verified. It will be available again once that check is resolved.",
         "WARN_NTC_RECENT": WARN_NTC_RECENT,
         "PAN_CHANGE_NEEDS_MANAGER": "A report already exists for this opportunity, so changing the PAN needs a manager. This has been flagged for review.",
         "LIVE_CALLS_DISABLED": "Eligibility checks are temporarily switched off on the server. Please try again later or contact the platform team.",
@@ -361,8 +473,9 @@ def _days(start: date, count: int) -> list[date]:
     return [start + timedelta(days=i) for i in range(count)]
 
 
-# 15 years of ISO dates: a 3-digit run can never hide inside YYYY-MM-DD, so the formatted fixed strings stay global-clean.
-DATE_SWEEP = _days(date(2024, 1, 1), 366 * 15)
+# 40 years of ISO dates: no run of 9+ digits or standalone 3-digit number can occur inside YYYY-MM-DD, so the formatted
+# fixed strings stay global-clean (this is what the unanchored bare-digit rule must never break).
+DATE_SWEEP = _days(date(2010, 1, 1), 366 * 40)
 
 
 def test_formatted_ntc_warning_passes_the_global_tier_for_every_date() -> None:
@@ -407,7 +520,7 @@ def test_module_imports_are_stdlib_state_safety_and_range_only() -> None:
             imported.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imported.add(node.module if node.module.startswith("eligibility_agent") else node.module.split(".")[0])
-    stdlib = {"__future__", "collections", "dataclasses", "datetime", "math", "re", "typing"}
+    stdlib = {"__future__", "collections", "dataclasses", "datetime", "math", "re", "typing", "unicodedata"}
     sanctioned = {
         "eligibility_agent.graph.state",
         "eligibility_agent.lenders.safety",

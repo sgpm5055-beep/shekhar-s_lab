@@ -14,6 +14,10 @@ Two tiers of leak scan, both by WHOLE-LINE drop (an offending line is removed, n
   "bureau report on <date>" and "No bureau file was found on <date>", so the generic word cannot be banned globally;
   the rule that holds everywhere is "never show a bureau NAME".
 
+Every scan runs on a normalised copy of the text (NFKC, invisible characters stripped), so fullwidth letters and
+digits, soft hyphens and zero-width characters cannot dodge the patterns. The DECISION is taken on the normalised copy;
+text that is kept is the ORIGINAL (nothing here ever rewrites a span: it is whole-line drop only).
+
 Tests and evals import the compiled patterns from here; nobody keeps a copy (the C11 rule).
 
 Contracts honoured here (controller K-rulings):
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -65,6 +70,7 @@ __all__ = [
     "ACCOUNT_ID_RE",
     "BUREAU_NAME_RE",
     "BUREAU_TERM_RE",
+    "FAILURE_LABELS",
     "GLOBAL_LEAK_PATTERNS",
     "LABEL_FULL_FMT",
     "LABEL_QUICK",
@@ -92,27 +98,36 @@ __all__ = [
 
 # --------------------------------------------------------------------------- leak patterns (single home)
 
-# PRD 7.3 pattern plus the optional plural: a strict superset of the FIXED rule. LLM-prose tier only.
-BUREAU_TERM_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:cibil|experian|equifax|crif|bureaus?)\b", re.IGNORECASE)
+# PRD 7.3 pattern plus the optional plural and the two further Indian bureau names (fix round 1, ruled: TransUnion and
+# Highmark; bare "Highmark" used to escape): a strict superset of the FIXED rule. LLM-prose tier only.
+BUREAU_TERM_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:cibil|experian|equifax|crif|transunion|highmark|bureaus?)\b", re.IGNORECASE
+)
 
 # Names only. The global tier uses this one so the PRD-mandated "bureau report on <date>" copy survives.
-BUREAU_NAME_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:cibil|experian|equifax|crif)\b", re.IGNORECASE)
+BUREAU_NAME_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:cibil|experian|equifax|crif|transunion|highmark)\b", re.IGNORECASE
+)
 
 # A standalone integer 300-899. Two fixed-width lookbehinds and two lookaheads: not digit-adjacent (1736, 7360), not a
 # grouped or decimal amount (3,500 / 12,34,567 / 0.736 / 736.50 / 736,000); Rs.736 and the rupee-sign form still hit.
 STANDALONE_SCORE_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(?<!\d[.,])[3-8]\d{2}(?!\d)(?![.,]\d)")
 
 # "No account list in any LC-facing string" (PRD 12 no_leak). Three alternatives:
-#   1. an account-number label followed by its value: "account number 1234", "a/c no: SYNTH0001", "acct # 99"
-#      (``no`` needs a word boundary so "account normally" is prose, not a label);
-#   2. a masked id: "XXXX1234", "****1234", "xxxx-1234" (the lookbehind, not \b, so a leading '*' can anchor);
-#   3. any bare run of 9 or more digits (account-like, never legitimate prose: amounts are grouped and short). The
-#      dossier capped this at 18 digits, which let a 19+ digit run escape; there is no upper bound here.
+#   1. an account-number label followed by its value: "account number 1234", "account numbers: 1234", "a/c no123",
+#      "acct # 99". ``no`` must not be followed by a letter, so "account normally serviced" is prose, not a label, while
+#      "no123" / "numbers" still are. The gap between label and value is bounded ({0,8}) so a long run of whitespace or
+#      dashes cannot make the scan quadratic;
+#   2. a masked id: "XXXX1234", "****1234", "xxxx-1234", "XXXX1234abc". The lookbehind (not \b, which can never anchor
+#      on '*') also forbids a preceding '*' so a long run of asterisks is scanned once, not once per position;
+#   3. any bare run of 9 or more digits, with NO word-boundary anchors: "LN00123456789", "acct_123456789" and
+#      "123456789abc" are as much account numbers as a lone run, and no legitimate prose has 9 adjacent digits (amounts
+#      are grouped and short, dates are 4-2-2). The dossier capped this at 18 digits and anchored it with \b.
 # The bare word "account" is deliberately NOT banned ("An account last updated <date>" is mandated copy).
 ACCOUNT_ID_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:a/?c|acct|account)\s*(?:no\b\.?|number\b|#)\s*[:\-]?\s*\S+"
-    r"|(?<!\w)[x*]{2,}[\s-]?\d{3,}\b"
-    r"|\b\d{9,}\b",
+    r"\b(?:a/?c|acct|account)\s*(?:no(?![a-z])\.?|numbers?|#)[\s:\-]{0,8}\S+"
+    r"|(?<![\w*])[x*]{2,}[\s-]?\d{3,}"
+    r"|\d{9,}",
     re.IGNORECASE,
 )
 
@@ -120,13 +135,28 @@ LLM_LEAK_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (BUREAU_TERM_RE, STANDAL
 GLOBAL_LEAK_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (BUREAU_NAME_RE, STANDALONE_SCORE_RE, ACCOUNT_ID_RE)
 
 
+# Invisible / formatting characters that split a word or a number without changing how it reads: zero-width space,
+# non-joiner, joiner, LRM / RLM (U+200B-U+200F), word joiner (U+2060), BOM / zero-width no-break space (U+FEFF) and the
+# soft hyphen (U+00AD). The ruled set was U+200B-200D, U+FEFF and U+00AD; the directional marks and the word joiner are
+# the same kind of character and are included.
+_INVISIBLE_RE: Final[re.Pattern[str]] = re.compile("[\u200b-\u200f\u2060\ufeff\u00ad]")
+
+
+def _normalize(text: str) -> str:
+    """The text the patterns actually see: NFKC (fullwidth to ASCII, compatibility forms folded), then the invisible
+    characters removed. Used for decisions only; kept text is never replaced by this copy."""
+    return _INVISIBLE_RE.sub("", unicodedata.normalize("NFKC", text))
+
+
 def line_leaks(line: str, patterns: Sequence[re.Pattern[str]] = LLM_LEAK_PATTERNS) -> bool:
-    """True when ``line`` matches any pattern. Defaults to the strict LLM-prose tier."""
-    return any(p.search(line) is not None for p in patterns)
+    """True when the normalised ``line`` matches any pattern. Defaults to the strict LLM-prose tier."""
+    text = _normalize(line)
+    return any(p.search(text) is not None for p in patterns)
 
 
 def scrub_lines(lines: Sequence[str]) -> list[str]:
-    """LLM-prose tier, whole-line drop: an offending line is removed, never partially edited."""
+    """LLM-prose tier, whole-line drop: an offending line is removed, never partially edited. A line that is kept is
+    returned as the original text (the scan, not the output, is normalised)."""
     return [line for line in lines if not line_leaks(line)]
 
 
@@ -155,6 +185,12 @@ RATIONALE_RANKING_UNAVAILABLE: Final[str] = "Automatic ranking unavailable; this
 # PRD 5.14 verbatim; ``.format(date=<YYYY-MM-DD>)`` at build time. Passes the global tier (generic 'bureau' allowed there).
 WARN_NTC_RECENT: Final[str] = "No bureau file was found on {date}; a full report will most likely return nothing. Proceed?"
 
+# The closed set of messages build_failure_lc_view accepts as its ``label`` (K13: label selection stays inside this
+# module). MSG_PAN_NOT_VERIFIED belongs to the pan_not_verified view and MSG_NO_PINCODE to the band-read view.
+FAILURE_LABELS: Final[frozenset[str]] = frozenset(
+    {MSG_PAN_SERVICE_FAILURE, MSG_BUREAU_SERVICE_FAILURE, MSG_PENDING_VERIFICATION, MSG_OPENAI_FAILURE, MSG_INTERNAL}
+)
+
 # The ten refusal codes: Code minus NO_PINCODE_ON_PAN (an ok band-read), SUREPASS_FAILURE and OPENAI_FAILURE (failures).
 REFUSAL_MESSAGES: Final[dict[Code, str]] = {
     "CONSENT_MISSING": "Consent was not recorded. Take the learner's verbal consent, tick the consent box and run the check again.",
@@ -163,7 +199,7 @@ REFUSAL_MESSAGES: Final[dict[Code, str]] = {
     "STAGE_TOO_EARLY": "A full check unlocks once this opportunity reaches the Offer stage. Until then, use the quick check.",
     "REPORT_WINDOW_OPEN": "This learner's full report is still current. Refresh unlocks once it is 30 days old.",
     "IN_FLIGHT": "A check for this learner is already running. Please wait for it to finish.",
-    "PAN_LOCKED": "This learner's record is locked for a few minutes while an earlier check is reconciled. Please try again shortly.",
+    "PAN_LOCKED": "This learner's PAN is temporarily locked while a previous check on it is verified. It will be available again once that check is resolved.",
     "WARN_NTC_RECENT": WARN_NTC_RECENT,
     "PAN_CHANGE_NEEDS_MANAGER": "A report already exists for this opportunity, so changing the PAN needs a manager. This has been flagged for review.",
     "LIVE_CALLS_DISABLED": "Eligibility checks are temporarily switched off on the server. Please try again later or contact the platform team.",
@@ -323,11 +359,12 @@ def _coapplicant(
 ) -> tuple[bool, str | None]:
     """``(suggested, reason)``. 'unlikely' and 'not_fundable_alone' force the suggestion (PRD 10: 'Unlikely alone,
     co-applicant suggested'); otherwise the model's own suggestion passes through. The reason is the model's prose,
-    scrubbed whole, and only shown when a co-applicant is actually suggested."""
+    scrubbed whole, and only shown when the MODEL itself suggested a co-applicant: a headline-forced suggestion the
+    model argued against carries no reason (its prose would defend the opposite)."""
     forced = headline in ("unlikely", "not_fundable_alone")
     suggested = forced or (model is not None and model.co_applicant_suggested)
     reason: str | None = None
-    if suggested and model is not None and model.co_applicant_reason is not None:
+    if model is not None and model.co_applicant_suggested and model.co_applicant_reason is not None:
         reason = _scrub_prose(model.co_applicant_reason) or None
     return suggested, reason
 
@@ -559,17 +596,23 @@ def build_failure_lc_view(
 ) -> LcView:
     """A section-10 failure (PAN / score / report service failure, or a pending-verification timeout).
 
-    ``label`` is the caller's fixed message; it must pass the global tier or the internal-error message is shown in
-    its place. ``pending_verification`` always carries ``code=None`` (K1), whatever the caller passes. No headline:
-    no band is known on these paths (the OPENAI_FAILURE band read is ``build_lc_view``'s K7 view).
+    ``label`` must be one of this module's failure messages (``FAILURE_LABELS``): label selection stays inside the
+    boundary (K13), so a free string, leaky or not, is a programming error. ``pending_verification`` always carries
+    ``code=None`` (K1), whatever the caller passes. No headline: no band is known on these paths. Raises ``ValueError``
+    for a label outside the set, and for ``service_failure`` + ``OPENAI_FAILURE``, the K7 view that only
+    ``build_lc_view`` can build (it carries the band read and the code-built alternates).
     """
+    if label not in FAILURE_LABELS:
+        raise ValueError("label must be one of this module's failure messages (FAILURE_LABELS)")
+    if status == "service_failure" and code == "OPENAI_FAILURE":
+        raise ValueError("service_failure + OPENAI_FAILURE is the K7 view: build it with build_lc_view")
     return LcView(
         check_id=check_id,
         kind=kind,
         status=status,
         code=None if status == "pending_verification" else code,
         headline=None,
-        label=_guard_admin(label, MSG_INTERNAL),
+        label=label,
         confidence=None,
         quick_checks_left_today=_quick_left(kind, quick_checks_left_today),
     )

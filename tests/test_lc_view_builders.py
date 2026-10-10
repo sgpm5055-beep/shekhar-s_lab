@@ -23,6 +23,7 @@ from typing import Any, Literal, cast
 
 import pytest
 
+from eligibility_agent.derive.emi import PAST_TENURE_CONFIRM_ITEM, _STALE_CONFIRM_PREFIX, _STALE_UNKNOWN_DATE_ITEM
 from eligibility_agent.derive.range import lender_numbers
 from eligibility_agent.graph.state import (
     Band,
@@ -51,6 +52,7 @@ from eligibility_agent.lenders.safety import check_pick, compute_headline, run_s
 from eligibility_agent.output import lc_view as lc_view_module
 from eligibility_agent.output.lc_view import (
     AADHAAR_WARNING,
+    FAILURE_LABELS,
     GLOBAL_LEAK_PATTERNS,
     LABEL_FULL_FMT,
     LABEL_QUICK,
@@ -71,6 +73,7 @@ from eligibility_agent.output.lc_view import (
     build_lc_view,
     build_refusal_lc_view,
     line_leaks,
+    scrub_lines,
 )
 
 # --------------------------------------------------------------------------- builders (synthetic only)
@@ -619,6 +622,39 @@ def test_the_coapplicant_reason_is_only_shown_when_a_coapplicant_is_suggested() 
     assert view.coapplicant_suggested is False and view.coapplicant_reason is None
 
 
+def test_a_headline_forced_coapplicant_never_surfaces_a_reason_the_model_gave_while_saying_no() -> None:
+    # fix round 1 (7): the reason is the model's justification FOR its own suggestion. When the model said no and the
+    # headline forced the flag, the model's reason argues for something it did not recommend: it is not shown.
+    state = make_state(
+        band="NTC",
+        income=30000.0,
+        model=mo("L2", co_applicant_suggested=False, co_applicant_reason="Income is stable without help"),
+    )
+    view = build_lc_view(state, ctx())
+    assert view.headline == "unlikely" and view.coapplicant_suggested is True
+    assert view.coapplicant_reason is None
+    gate_empty = make_state(
+        gated=[],
+        numbers={},
+        model=mo(None, co_applicant_suggested=False, co_applicant_reason="Income is stable without help"),
+        code_confidence="low",
+    )
+    forced = build_lc_view(gate_empty, ctx())
+    assert forced.headline == "not_fundable_alone" and forced.coapplicant_suggested is True
+    assert forced.coapplicant_reason is None
+
+
+def test_a_model_reason_is_shown_when_the_model_itself_suggested_a_coapplicant_even_if_the_headline_also_forces_it() -> None:
+    state = make_state(
+        band="NTC",
+        income=30000.0,
+        model=mo("L2", co_applicant_suggested=True, co_applicant_reason="A co-applicant with a credit history would help"),
+    )
+    view = build_lc_view(state, ctx())
+    assert view.headline == "unlikely"
+    assert view.coapplicant_reason == "A co-applicant with a credit history would help"
+
+
 def test_a_leaky_coapplicant_reason_is_dropped_whole() -> None:
     for leaky in ("Experian shows a thin file", "Score is 736 so add a co-applicant", "a/c no: SYNTH0001 is open"):
         state = make_state(model=mo("L1", co_applicant_suggested=True, co_applicant_reason=leaky))
@@ -774,6 +810,19 @@ def test_items_to_confirm_keep_the_mandated_stale_account_copy_and_drop_leaking_
         "past tenure, confirm with learner",
         "confirm with learner: an account last updated 2026-05-20",
     ]
+    assert_clean(view)
+
+
+def test_every_confirm_string_derive_emi_can_emit_survives_the_scrub_and_reaches_the_view() -> None:
+    # Imported from derive/emi.py, never retyped: if emi.py changes a string this fails instead of drifting.
+    emitted = (
+        PAST_TENURE_CONFIRM_ITEM,
+        f"{_STALE_CONFIRM_PREFIX} 2026-05-20",
+        _STALE_UNKNOWN_DATE_ITEM,
+    )
+    assert scrub_lines(list(emitted)) == list(emitted)
+    view = build_lc_view(make_state(confirm_items=emitted), ctx())
+    assert view.items_to_confirm == list(emitted)
     assert_clean(view)
 
 
@@ -1261,31 +1310,61 @@ def test_service_failure_view_may_carry_no_code() -> None:
     assert (view.status, view.code, view.label) == ("service_failure", None, MSG_INTERNAL)
 
 
-def test_failure_view_headline_is_none_even_for_openai_failure() -> None:
-    view = build_failure_lc_view(
-        check_id="c",
-        kind="quick",
-        status="service_failure",
-        code="OPENAI_FAILURE",
-        label=MSG_OPENAI_FAILURE,
-        quick_checks_left_today=1,
+def test_the_k7_pair_belongs_to_build_lc_view_not_the_failure_builder() -> None:
+    # fix round 1 (6b): service_failure + OPENAI_FAILURE is the K7 view (band read + code-built alternates), which only
+    # build_lc_view can build. The failure builder refuses the pair instead of producing a headline-less impostor.
+    with pytest.raises(ValueError, match="OPENAI_FAILURE"):
+        build_failure_lc_view(
+            check_id="c",
+            kind="quick",
+            status="service_failure",
+            code="OPENAI_FAILURE",
+            label=MSG_OPENAI_FAILURE,
+            quick_checks_left_today=1,
+        )
+
+
+def test_the_failure_label_set_is_exactly_the_modules_failure_messages() -> None:
+    assert FAILURE_LABELS == frozenset(
+        {MSG_PAN_SERVICE_FAILURE, MSG_BUREAU_SERVICE_FAILURE, MSG_PENDING_VERIFICATION, MSG_OPENAI_FAILURE, MSG_INTERNAL}
     )
-    assert view.headline is None and view.code == "OPENAI_FAILURE"
+    # every MSG_* constant is either a failure label or one of the two that belong to other builders
+    msgs = {name: value for name, value in vars(lc_view_module).items() if name.startswith("MSG_") and isinstance(value, str)}
+    assert {v for v in msgs.values()} - FAILURE_LABELS == {MSG_PAN_NOT_VERIFIED, MSG_NO_PINCODE}
 
 
-@pytest.mark.parametrize("label", ["Experian is down", "Try 736 again", "a/c no: 1 failed"])
-def test_a_leaky_failure_label_is_replaced_by_the_internal_message(label: str) -> None:
+@pytest.mark.parametrize("label", sorted(FAILURE_LABELS))
+def test_every_failure_label_is_accepted(label: str) -> None:
     view = build_failure_lc_view(
         check_id="c", kind="quick", status="service_failure", code=None, label=label, quick_checks_left_today=None
     )
-    assert view.label == MSG_INTERNAL
+    assert view.label == label
 
 
-def test_the_generic_bureau_word_is_allowed_in_a_failure_label_on_the_global_tier() -> None:
-    view = build_failure_lc_view(
-        check_id="c", kind="quick", status="service_failure", code=None, label="bureau check failed", quick_checks_left_today=None
-    )
-    assert view.label == "bureau check failed"
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Experian is down",
+        "Try 736 again",
+        "a/c no: 1 failed",
+        "bureau check failed",  # clean on the global tier, but not one of this module's messages
+        MSG_INTERNAL + " ",
+        MSG_INTERNAL.lower(),
+        "",
+        MSG_PAN_NOT_VERIFIED,  # belongs to the pan_not_verified view
+        MSG_NO_PINCODE,
+        REFUSAL_MESSAGES["QUOTA_EXHAUSTED"],
+    ],
+)
+def test_a_label_outside_the_closed_failure_set_is_a_programming_error(label: str) -> None:
+    with pytest.raises(ValueError, match="label"):
+        build_failure_lc_view(
+            check_id="c", kind="quick", status="service_failure", code=None, label=label, quick_checks_left_today=None
+        )
+    with pytest.raises(ValueError, match="label"):
+        build_failure_lc_view(
+            check_id="c", kind="quick", status="pending_verification", code=None, label=label, quick_checks_left_today=None
+        )
 
 
 # --------------------------------------------------------------------------- build_error_lc_view
