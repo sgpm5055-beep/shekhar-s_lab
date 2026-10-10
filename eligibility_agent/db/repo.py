@@ -436,7 +436,11 @@ class Repo(Protocol):
 
     def release_pan_lock(self, pan_hash: str, check_id: str) -> None: ...  # holder-only, in_flight-only, idempotent
 
-    def create_pan_lock(self, pan_hash: str, kind: LockKind, check_id: str | None, until: datetime) -> None: ...
+    # timeout/daily_cap upsert only: in_flight is written solely by try_acquire_pan_lock (atomic RPC), so ``kind``
+    # excludes it and pyright rejects any caller that would overwrite a live in-flight lock.
+    def create_pan_lock(
+        self, pan_hash: str, kind: Literal["timeout", "daily_cap"], check_id: str | None, until: datetime
+    ) -> None: ...
 
     def get_active_locks(self, pan_hash: str) -> list[PanLockRow]: ...
 
@@ -651,7 +655,9 @@ class MemoryRepo:
         if held is not None and held.check_id == check_id and held.released_at is None:
             self._locks[(pan_hash, "in_flight")] = replace(held, released_at=self._clock())
 
-    def create_pan_lock(self, pan_hash: str, kind: LockKind, check_id: str | None, until: datetime) -> None:
+    def create_pan_lock(
+        self, pan_hash: str, kind: Literal["timeout", "daily_cap"], check_id: str | None, until: datetime
+    ) -> None:
         self._locks[(pan_hash, kind)] = PanLockRow(pan_hash, kind, check_id, self._clock(), until, None)
 
     def get_active_locks(self, pan_hash: str) -> list[PanLockRow]:
@@ -1090,7 +1096,9 @@ class SupabaseRepo:
             .execute()
         )
 
-    def create_pan_lock(self, pan_hash: str, kind: LockKind, check_id: str | None, until: datetime) -> None:
+    def create_pan_lock(
+        self, pan_hash: str, kind: Literal["timeout", "daily_cap"], check_id: str | None, until: datetime
+    ) -> None:
         row = PanLockRow(pan_hash, kind, check_id, self._clock(), until, None)
         self._client.table("pan_locks").upsert(_encode(row), on_conflict="pan_hash,kind").execute()
 

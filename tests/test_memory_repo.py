@@ -9,7 +9,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, cast, get_args
+from typing import Any, Literal, cast, get_args, get_type_hints
 
 import pytest
 from repo_builders import (
@@ -58,7 +58,7 @@ from eligibility_agent.db.repo import (
     storage_key_for,
     utc_now,
 )
-from eligibility_agent.graph.state import Code
+from eligibility_agent.graph.state import Code, LockKind
 
 REPO_FILE = Path(repo_module.__file__)
 PACKAGE_ROOT = REPO_FILE.parents[1]  # eligibility_agent/
@@ -840,6 +840,16 @@ def test_create_pan_lock_upserts_per_kind_and_get_active_locks_honours_expiry_an
     clock.advance(hours=10)
     assert repo.get_active_locks(PAN_A) == []
     assert [lock.pan_hash for lock in repo.get_active_locks(PAN_B)] == []  # PAN_B's lock expired too
+
+
+def test_create_pan_lock_kind_is_narrowed_to_timeout_and_daily_cap_on_protocol_and_both_backends() -> None:
+    """Task 7: in_flight locks are written ONLY by the try_acquire RPC (the sole-safe-writer invariant), so
+    create_pan_lock's ``kind`` is ``Literal['timeout', 'daily_cap']`` on the Protocol, MemoryRepo and SupabaseRepo
+    together; pyright (strict, part of the gate) then rejects any in_flight caller. LockKind itself is unchanged."""
+    for owner in (Repo, MemoryRepo, SupabaseRepo):
+        assert get_type_hints(owner.create_pan_lock)["kind"] == Literal["timeout", "daily_cap"], owner
+    assert get_args(LockKind) == ("in_flight", "timeout", "daily_cap")
+    assert get_args(get_type_hints(PanLockRow)["kind"]) == ("in_flight", "timeout", "daily_cap")  # rows still hold all 3
 
 
 def test_in_flight_acquire_does_not_disturb_timeout_or_daily_cap_locks() -> None:
