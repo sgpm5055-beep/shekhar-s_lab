@@ -223,9 +223,9 @@ class LenderNumbers(_Frozen):
 
     lender_id: str
     available_emi: float | None  # None when no income; 0.0 -> not fundable alone with this lender
-    loan_max_lower: float | None  # display value, floored to 1000
-    loan_max_upper: float | None  # display value, floored to 1000; == ceiling
-    loan_max_lower_raw: float | None  # unrounded, internal + safety
+    loan_max_lower: float | None  # display value, half-up to 1000 (K6: derive.range.round_to_nearest_1000)
+    loan_max_upper: float | None  # display value, half-up to 1000 (K6); == ceiling
+    loan_max_lower_raw: float | None  # unrounded AND unclipped annuity value, internal + safety
     loan_max_upper_raw: float | None
     ceiling: float | None
     displayed_foir: float | None  # (emi.used + emi(P_wc at r_max, n_max)) / income

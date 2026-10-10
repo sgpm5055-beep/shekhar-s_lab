@@ -157,14 +157,14 @@ def test_pin_re_is_the_registry_pattern() -> None:
     assert PIN_RE.fullmatch("560001") and not PIN_RE.fullmatch("056001") and not PIN_RE.fullmatch("5600011")
 
 
-def test_range_seed_module_is_minimal_and_documents_the_task_6_extension() -> None:
+def test_range_module_keeps_the_seed_functions_and_a_pure_import_surface() -> None:
+    # Task 6 EXTENDED the Task-5 seed in place (the exact-function-set pin is relaxed to >=); the seed behavior is
+    # pinned by the two parametrized tests above, and the full derive/range surface by tests/test_range_math.py.
     path = PACKAGE_DIR / "derive" / "range.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    doc = ast.get_docstring(tree) or ""
-    assert "Task 6" in doc and "extend" in doc.lower()
-    assert _imports(tree) <= {"__future__", "re", "typing", "eligibility_agent.graph.state"}
+    assert _imports(tree) <= {"__future__", "math", "re", "datetime", "typing", "eligibility_agent.graph.state"}
     funcs = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    assert funcs == {"is_ntc_value", "band_from_score"}
+    assert {"is_ntc_value", "band_from_score"} <= funcs
 
 
 # --------------------------------------------------------------------------- parsing helpers
