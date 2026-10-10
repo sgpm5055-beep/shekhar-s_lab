@@ -13,36 +13,55 @@ PII rule (PRD 11, brief ruling 13): trace metadata carries ``check_id``, ``pan_h
 plans, and the billed / counted flags, NOTHING else; never the raw PAN, the learner's name or the mobile number. The key
 sets are frozen below and pinned by tests.
 
-Run PAYLOADS never leave the process (fix round 1, binding). Every node run's inputs / outputs are the graph state (raw
-PAN, mobile, names, score facts, prompts), so ``make_langsmith_client`` builds the client with ``hide_inputs`` /
-``hide_outputs`` callables that drop the payload entirely, and ``make_tracer`` binds a ``LangChainTracer`` to it.
-``invoke_config(tracer=...)`` attaches that tracer explicitly; with a ``LangChainTracer`` already among the callbacks,
-langchain-core adds no env-driven default tracer (whose default client would not hide anything). Metadata and tags are
-kept: they are the only thing a trace is for here. Residual (flagged): a child run's ``error`` string is not dropped by
-these hooks; the nodes' own exception texts are PII-free by construction.
+Run PAYLOADS never leave the process, and every string that does is scrubbed (fix rounds 1-2, binding):
+
+* ``make_langsmith_client``: ``hide_inputs=True`` / ``hide_outputs=True`` (every node run's inputs / outputs are the
+  graph state: raw PAN, mobile, names, score facts, prompts) plus ``anonymizer=scrub_trace_payload``, which langsmith
+  routes the run ``error`` text and every metadata value through.
+* ``PayloadFreeTracer`` (``make_tracer``): run ``name`` and ``tags`` never reach langsmith's anonymizer, so the tracer
+  scrubs them on the run itself, at start and again before the end patch.
+* The scrub is the output boundary's GLOBAL tier (``GLOBAL_LEAK_PATTERNS`` + ``line_leaks``, imported, never copied:
+  bureau names, standalone 300-899 numbers incl. band-label numbers, account ids incl. any 9+ digit run such as a
+  mobile) plus a raw-PAN search pattern derived from ``policy.guards.PAN_RE`` (the global tier alone does not match a
+  PAN). Matched spans are replaced with ``TRACE_MASK``; fail-closed: a string whose normalised form still leaks, or one
+  longer than ``MAX_TRACE_STRING_CHARS``, is replaced whole. Identifier-shaped values under ``pan_hash`` (64 hex) and
+  ``check_id`` / ``thread_id`` (uuid) are kept verbatim: their hex can trip the score pattern structurally.
+* ``invoke_config(tracer=...)`` attaches the tracer explicitly; with a ``LangChainTracer`` already among the callbacks,
+  langchain-core adds no env-driven default tracer (whose default client would hide nothing).
+
+Residual: a learner's NAME in free text has no pattern; names only reach traced strings through inputs / outputs,
+which are dropped whole.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, cast
 from uuid import UUID, uuid4
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tracers.langchain import LangChainTracer
+from langchain_core.tracers.schemas import Run
 from langsmith import Client
 
 from eligibility_agent.graph.state import AdmissionDecision, Kind
+from eligibility_agent.output.lc_view import GLOBAL_LEAK_PATTERNS, line_leaks
+from eligibility_agent.policy.guards import PAN_RE
 
 __all__ = [
     "FINISH_METADATA_KEYS",
     "INVOKE_METADATA_KEYS",
+    "MAX_TRACE_STRING_CHARS",
+    "PAN_SEARCH_RE",
     "RECURSION_LIMIT",
+    "TRACE_MASK",
+    "TRACE_SCRUB_PATTERNS",
+    "PayloadFreeTracer",
     "RunUpdater",
     "base_tags",
-    "drop_payload",
     "finish_trace",
     "invoke_config",
     "make_langsmith_client",
@@ -69,24 +88,87 @@ class RunUpdater(Protocol):
     def update_run(self, run_id: UUID, *, tags: list[str] | None = ..., extra: dict[str, Any] | None = ...) -> None: ...
 
 
-def drop_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """The ``hide_inputs`` / ``hide_outputs`` hook: whatever a run carried, nothing of it is exported."""
-    del payload
-    return {}
+# --------------------------------------------------------------------------- the trace scrub
+
+TRACE_MASK: Final[str] = "[redacted]"
+MAX_TRACE_STRING_CHARS: Final[int] = 32_000  # longer strings are masked whole (fail closed; bounds normalisation cost)
+# A raw PAN anywhere in a string: the policy's own PAN pattern, unanchored, any case, not inside a longer token.
+PAN_SEARCH_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9])" + PAN_RE.pattern.removeprefix("^").removesuffix("$") + r"(?![A-Za-z0-9])", re.IGNORECASE
+)
+TRACE_SCRUB_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (*GLOBAL_LEAK_PATTERNS, PAN_SEARCH_RE)
+_HEX64: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
+_UUID: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Identifier values kept verbatim, by key AND shape (anything else under these keys is scrubbed like any string).
+_ID_SHAPES: Final[dict[str, re.Pattern[str]]] = {"pan_hash": _HEX64, "check_id": _UUID, "thread_id": _UUID}
+
+
+def scrub_trace_text(text: str) -> str:
+    """Replace every span the trace patterns match with ``TRACE_MASK``. Fail closed: a string whose NORMALISED form
+    still leaks (fullwidth digits, invisible separators) or that exceeds ``MAX_TRACE_STRING_CHARS`` is masked whole."""
+    if len(text) > MAX_TRACE_STRING_CHARS:
+        return TRACE_MASK
+    scrubbed = text
+    for pattern in TRACE_SCRUB_PATTERNS:
+        scrubbed = pattern.sub(TRACE_MASK, scrubbed)
+    return TRACE_MASK if line_leaks(scrubbed, TRACE_SCRUB_PATTERNS) else scrubbed
+
+
+def _scrub_value(key: str | None, value: object) -> object:
+    if isinstance(value, str):
+        shape = _ID_SHAPES.get(key) if key is not None else None
+        return value if shape is not None and shape.fullmatch(value) else scrub_trace_text(value)
+    if isinstance(value, dict):
+        items = cast("dict[object, object]", value).items()
+        return {k: _scrub_value(str(k), v) for k, v in items}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_value(key, v) for v in cast("list[object] | tuple[object, ...]", value)]
+    return value
+
+
+def scrub_trace_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """The langsmith ``anonymizer``: every string at any depth goes through ``scrub_trace_text`` (it receives the run's
+    metadata, and its error text wrapped as ``{"error": ...}``). Total; on any surprise every value is masked."""
+    try:
+        return {key: _scrub_value(key, value) for key, value in payload.items()}
+    except Exception:
+        return {key: TRACE_MASK for key in payload}
+
+
+class PayloadFreeTracer(LangChainTracer):
+    """A ``LangChainTracer`` that also scrubs each run's ``name`` and ``tags`` (langsmith's anonymizer never sees them)."""
+
+    def _start_trace(self, run: Run) -> None:
+        super()._start_trace(run)
+        _scrub_labels(run)
+
+    def _end_trace(self, run: Run) -> None:
+        _scrub_labels(run)  # before the end patch is built
+        super()._end_trace(run)
+
+
+def _scrub_labels(run: Run) -> None:
+    if run.name:
+        run.name = scrub_trace_text(run.name)
+    if run.tags:
+        run.tags = [scrub_trace_text(tag) for tag in run.tags]
 
 
 def make_langsmith_client(
     *, api_key: str | None = None, api_url: str | None = None, client_cls: type[Client] = Client
 ) -> Client:
-    """The ONE LangSmith client the service traces with: run inputs and outputs are dropped client-side, before any
-    upload; metadata and tags pass. ``api_key`` / ``api_url`` default to the LANGSMITH_* environment. ``client_cls``
-    exists for tests (a recording subclass keeps the real hiding logic and replaces only the send hooks)."""
-    return client_cls(api_key=api_key, api_url=api_url, hide_inputs=drop_payload, hide_outputs=drop_payload)
+    """The ONE LangSmith client the service traces with: run inputs and outputs are dropped and every other exported
+    string (error text, metadata values) is scrubbed client-side, before any upload. ``api_key`` / ``api_url`` default
+    to the LANGSMITH_* environment. ``client_cls`` exists for tests (a recording subclass keeps the real hiding and
+    anonymizing logic and replaces only the send hooks)."""
+    return client_cls(
+        api_key=api_key, api_url=api_url, hide_inputs=True, hide_outputs=True, anonymizer=scrub_trace_payload
+    )
 
 
-def make_tracer(client: Client, *, project_name: str) -> LangChainTracer:
+def make_tracer(client: Client, *, project_name: str) -> PayloadFreeTracer:
     """The tracer every graph invocation attaches through ``invoke_config(tracer=...)`` when tracing is on."""
-    return LangChainTracer(client=client, project_name=project_name)
+    return PayloadFreeTracer(client=client, project_name=project_name)
 
 
 def new_run_id(enabled: bool) -> UUID | None:

@@ -1312,6 +1312,72 @@ def test_traced_runs_export_metadata_but_never_payloads() -> None:
     assert root and all(p["extra"]["metadata"]["pan_hash"] == pan_hash_of() for p in root)
 
 
+_STANDALONE_720 = re.compile(r"(?<![0-9A-Za-z])720(?![0-9A-Za-z])")
+
+
+def test_a_poisoned_error_name_and_tag_export_scrubbed_while_pan_hash_survives() -> None:
+    world = make_world(happy_quick)
+    world.repo.fail_lenders = RuntimeError(f"lender lookup for {PAN_OK} failed at Experian with score 720")
+    client = tracing.make_langsmith_client(
+        api_key="test-key", api_url="http://langsmith.invalid", client_cls=RecordingClient
+    )
+    assert isinstance(client, RecordingClient)
+    tracer = tracing.make_tracer(client, project_name="eligibility-agent-test")
+    run_id = tracing.new_run_id(True)
+    config = tracing.invoke_config(kind="quick", check_id="chk-poison", lc_id="lc-720", pan_hash=pan_hash_of(),
+                                   run_id=run_id, tracer=tracer)
+    config["run_name"] = f"check for {PAN_OK}"  # a poisoned run name
+    with pytest.raises(RuntimeError):
+        invoke(build_graph("quick", world.deps), check_state("quick", "chk-poison"), config)
+    tracer.wait_for_futures()
+
+    exported = client.exported
+    errors = [str(p["error"]) for p in exported if p.get("error")]
+    assert errors  # the failing node and the root both carry the error
+    for text in errors:
+        assert PAN_OK not in text and "experian" not in text.lower() and _STANDALONE_720.search(text) is None
+    assert any("lender lookup for" in t and tracing.TRACE_MASK in t for t in errors)  # spans replaced, rest kept
+    for payload in exported:
+        visible = repr({k: payload.get(k) for k in ("name", "tags", "extra")})
+        assert PAN_OK not in visible and _STANDALONE_720.search(visible) is None, payload.get("name")
+    root = [p for p in exported if p.get("id") == run_id and p.get("extra")]
+    assert root and all(p["extra"]["metadata"]["pan_hash"] == pan_hash_of() for p in root)  # intact, not scrubbed
+    assert all(p["extra"]["metadata"]["check_id"] == "chk-poison" for p in root)
+
+
+def test_trace_scrub_replaces_spans_and_fails_closed() -> None:
+    scrub = tracing.scrub_trace_text
+    mask = tracing.TRACE_MASK
+    assert scrub(f"pan {PAN_OK.lower()} at CIBIL scored 745") == f"pan {mask} at {mask} scored {mask}"
+    assert scrub("band 650-720 on file") == f"band {mask}-{mask} on file"  # band labels are score numbers
+    assert scrub("mobile 9876543210") == f"mobile {mask}"
+    assert scrub("bureau report on 2026-10-01") == "bureau report on 2026-10-01"  # global tier: names only, dates pass
+    assert scrub("score \uff17\uff14\uff15 (fullwidth)") == mask  # only the normalised form leaks: whole string
+    assert scrub("x" * (tracing.MAX_TRACE_STRING_CHARS + 1)) == mask  # oversized: fail closed
+
+    hex_hash = pan_hash_of()
+    uuid_text = "1a2b745c-0000-4000-8000-000000000745"
+    payload = {
+        "pan_hash": hex_hash,
+        "check_id": uuid_text,
+        "thread_id": uuid_text,
+        "tier": "quick",
+        "nested": {"pan_hash": f"not a hash {PAN_OK}", "items": ["fine", "cibil", 720, None]},
+        "error": f"failed for {PAN_OK}",
+    }
+    out = tracing.scrub_trace_payload(payload)
+    assert (out["pan_hash"], out["check_id"], out["thread_id"]) == (hex_hash, uuid_text, uuid_text)  # id shapes kept
+    assert out["nested"] == {"pan_hash": f"not a hash {mask}", "items": ["fine", mask, 720, None]}
+    assert out["error"] == f"failed for {mask}" and out["tier"] == "quick"
+
+
+def test_the_trace_client_hides_payloads_and_anonymizes_the_rest() -> None:
+    client = tracing.make_langsmith_client(api_key="k", api_url="http://langsmith.invalid", client_cls=RecordingClient)
+    assert getattr(client, "_hide_inputs") is True and getattr(client, "_hide_outputs") is True
+    assert getattr(client, "_anonymizer") is tracing.scrub_trace_payload
+    assert isinstance(tracing.make_tracer(client, project_name="p"), tracing.PayloadFreeTracer)
+
+
 def test_new_check_state_seeds_counters_and_no_derived_keys() -> None:
     state = check_state("quick", "chk-seed-shape", langsmith_run_id="run-1")
     assert state.get("rank_attempts") == 0 and state.get("transcript") == [] and state.get("errors") == []
