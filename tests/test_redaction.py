@@ -36,6 +36,7 @@ from eligibility_agent.output.lc_view import (
     LABEL_QUICK,
     LABEL_QUICK_NO_EMI,
     LLM_LEAK_PATTERNS,
+    MAX_PROSE_LINE_CHARS,
     MSG_BUREAU_SERVICE_FAILURE,
     MSG_INTERNAL,
     MSG_NO_PINCODE,
@@ -250,6 +251,15 @@ def test_account_id_keep_vectors_on_both_tiers(line: str) -> None:
     assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False
 
 
+def test_known_gap_an_x_only_mask_of_33_plus_characters_after_a_non_word_character_is_outside_the_pattern() -> None:
+    # Recorded, not endorsed: the masked-id run is bounded to 32 characters so the scan stays linear. Real masks are
+    # 4-16 characters; an asterisk mask of ANY length is still caught (see the long-asterisk test).
+    line = " " + "x" * 40 + "1234"
+    assert ACCOUNT_ID_RE.search(line) is None
+    assert line_leaks(line, LLM_LEAK_PATTERNS) is False
+    assert line_leaks(" " + "x" * 32 + "1234", LLM_LEAK_PATTERNS) is True  # the bound itself is caught
+
+
 @pytest.mark.parametrize("line", GLUED_SHAPES)
 def test_glued_asterisk_masks_leak_on_both_tiers(line: str) -> None:
     assert ACCOUNT_ID_RE.search(line) is not None
@@ -314,6 +324,13 @@ NORMALIZATION_DROP = [
     "CI\ufe0fBIL",  # variation selector-16 inside a word
     "Ex\u180bperian",  # mongolian free variation selector
     "account number 12345\u200e6789",
+    # fix round 3 (1): UNASSIGNED code points Unicode reserves as default-ignorable (renderers hide them)
+    "Score is 7\u206536",
+    "CI\u2065BIL",
+    "Score is 7\ufff036",
+    "Score is 7\U000e000036",  # U+E0000
+    "CI\U000e0080BIL",
+    "Score is 7\U000e01f036",
 ]
 
 NORMALIZATION_KEEP = [
@@ -359,6 +376,26 @@ def test_every_unicode_format_character_is_invisible_to_the_scan() -> None:
         assert line_leaks(f"1234{ch}56789") is True, hex(ord(ch))
 
 
+# Code points Unicode RESERVES as default-ignorable while leaving them unassigned (category Cn, so a Cf check misses them).
+RESERVED_DEFAULT_IGNORABLES: list[int] = [
+    0x2065,
+    *range(0xFFF0, 0xFFF9),
+    0xE0000,
+    *range(0xE0002, 0xE0020),
+    *range(0xE0080, 0xE0100),
+    *range(0xE01F0, 0xE1000),
+]
+
+
+def test_every_reserved_default_ignorable_code_point_is_invisible_to_the_scan() -> None:
+    assert len(RESERVED_DEFAULT_IGNORABLES) > 3000  # the ranges really were enumerated
+    for cp in RESERVED_DEFAULT_IGNORABLES:
+        ch = chr(cp)
+        assert line_leaks(f"Score is 7{ch}36") is True, hex(cp)
+        assert line_leaks(f"CI{ch}BIL") is True, hex(cp)
+        assert line_leaks(f"1234{ch}56789") is True, hex(cp)
+
+
 # --------------------------------------------------------------------------- bounded backtracking (fix round 1)
 
 
@@ -376,6 +413,9 @@ HOSTILE_INPUTS: dict[str, str] = {
     "repeated-label": "a/c " * 20_000,
     "digit-run": "1" * 100_000,
     "zero-width-run": "\u200b" * 50_000 + "7" + "\u200b" * 50_000,  # the normaliser itself is linear
+    # NFKC reorders combining marks quadratically (80k chars took ~1.6s, x4 per doubling): the LLM-prose tier drops an
+    # over-long line BEFORE normalising, so this must be instant
+    "combining-marks": "a" + "\u0301\u0316" * 40_000,
 }
 
 
@@ -385,6 +425,41 @@ def test_the_account_pattern_does_not_backtrack_quadratically(name: str) -> None
     line_leaks(HOSTILE_INPUTS[name], LLM_LEAK_PATTERNS)
     # linear scans finish in milliseconds; each quadratic shape this pins takes tens of seconds at these sizes
     assert time.perf_counter() - started < 1.0
+
+
+# --------------------------------------------------------------------------- prose-line length cap (fix round 3, ruled)
+
+
+def test_the_prose_line_cap_is_four_thousand_characters() -> None:
+    assert MAX_PROSE_LINE_CHARS == 4000
+
+
+def test_an_over_long_llm_prose_line_is_dropped_before_any_scan() -> None:
+    clean_at_the_cap = "a " * (MAX_PROSE_LINE_CHARS // 2)
+    assert len(clean_at_the_cap) == MAX_PROSE_LINE_CHARS
+    assert line_leaks(clean_at_the_cap, LLM_LEAK_PATTERNS) is False  # the cap is inclusive
+    assert line_leaks(clean_at_the_cap + "a", LLM_LEAK_PATTERNS) is True  # one over: dropped, fail closed
+    assert line_leaks("a" * 200_000) is True  # default tier is the LLM tier
+
+
+def test_the_cap_drops_the_line_through_scrub_lines_and_never_edits_it() -> None:
+    long_line = "Income looks steady. " * 300
+    assert len(long_line) > MAX_PROSE_LINE_CHARS
+    assert scrub_lines(["short and clean", long_line, "also clean"]) == ["short and clean", "also clean"]
+
+
+def test_the_cap_is_llm_tier_only() -> None:
+    # the global tier scans admin strings and fixed copy, which are never model prose
+    long_admin = "Alpha Education Finance " * 300
+    assert len(long_admin) > MAX_PROSE_LINE_CHARS
+    assert line_leaks(long_admin, GLOBAL_LEAK_PATTERNS) is False
+
+
+def test_a_normal_length_line_with_a_few_combining_marks_is_unaffected() -> None:
+    line = "Cafe\u0301 income and re\u0301sume\u0301 look steady, ni\u0303o fine"
+    assert line_leaks(line, LLM_LEAK_PATTERNS) is False
+    assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False
+    assert scrub_lines([line]) == [line]  # kept as the ORIGINAL text
 
 
 # --------------------------------------------------------------------------- label-tier vectors (the two-tier reason)

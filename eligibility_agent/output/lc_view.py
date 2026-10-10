@@ -76,6 +76,7 @@ __all__ = [
     "LABEL_QUICK",
     "LABEL_QUICK_NO_EMI",
     "LLM_LEAK_PATTERNS",
+    "MAX_PROSE_LINE_CHARS",
     "MSG_BUREAU_SERVICE_FAILURE",
     "MSG_INTERNAL",
     "MSG_NO_PINCODE",
@@ -123,7 +124,9 @@ STANDALONE_SCORE_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(?<!\d[.,])[3-
 #      "card****1234", "Max****1234"). A match may start where no word character precedes it (so "IDxxxx1234" and
 #      "Max1234" are not masks) OR at an asterisk (an asterisk is never part of a word). The run is bounded to 32
 #      characters so the scan is linear even on a hostile alternating run (an unbounded run is quadratic: every
-#      asterisk after a letter is a fresh start); a longer asterisk run is still caught from a later start inside it;
+#      asterisk after a letter is a fresh start); a longer asterisk run is still caught from a later start inside it.
+#      KNOWN RESIDUAL: an x-only mask of 33+ characters after a non-word character escapes (asterisk masks of any
+#      length are caught); real masks are 4-16 characters;
 #   3. any bare run of 9 or more digits, with NO word-boundary anchors: "LN00123456789", "acct_123456789" and
 #      "123456789abc" are as much account numbers as a lone run, and no legitimate prose has 9 adjacent digits (amounts
 #      are grouped and short, dates are 4-2-2). The dossier capped this at 18 digits and anchored it with \b.
@@ -138,17 +141,30 @@ ACCOUNT_ID_RE: Final[re.Pattern[str]] = re.compile(
 LLM_LEAK_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (BUREAU_TERM_RE, STANDALONE_SCORE_RE, ACCOUNT_ID_RE)
 GLOBAL_LEAK_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (BUREAU_NAME_RE, STANDALONE_SCORE_RE, ACCOUNT_ID_RE)
 
+# DoS guard, fail closed: in the LLM-prose tier a line longer than this is treated as leaking and dropped BEFORE it is
+# normalised (model prose lines are never legitimately this long, and NFKC is quadratic on multi-10k-character runs of
+# out-of-order combining marks: ~1.6s at 80k characters, x4 per doubling). Inclusive: a line of exactly this length is
+# scanned normally. The global tier (admin strings, fixed copy) is not capped.
+MAX_PROSE_LINE_CHARS: Final[int] = 4000
+
 
 # Characters that split a word or a number without changing how it reads. Every Unicode format character (category Cf:
 # zero-width space / joiners, bidi marks and isolates, word joiner, invisible operators, BOM, soft hyphen, tags, ...) is
 # stripped, plus the default-ignorable code points that are NOT Cf: combining grapheme joiner (U+034F), the Hangul and
-# Khmer fillers, Mongolian free variation selectors, the variation selectors and the halfwidth Hangul filler.
+# Khmer fillers, Mongolian free variation selectors, the variation selectors and the halfwidth Hangul filler, plus the
+# UNASSIGNED (category Cn) code points Unicode reserves as default-ignorable, which a conforming renderer hides just the
+# same: U+2065, U+FFF0-U+FFF8, U+E0000, U+E0002-U+E001F, U+E0080-U+E00FF and U+E01F0-U+E0FFF.
 _INVISIBLE_NON_CF: Final[frozenset[str]] = frozenset(
     {"\u034f", "\u115f", "\u1160", "\u17b4", "\u17b5", "\u3164", "\uffa0"}
     | {chr(cp) for cp in range(0x180B, 0x180E)}  # U+180B-U+180D (U+180E is Cf)
     | {"\u180f"}
     | {chr(cp) for cp in range(0xFE00, 0xFE10)}  # variation selectors U+FE00-U+FE0F
     | {chr(cp) for cp in range(0xE0100, 0xE01F0)}  # variation selectors supplement
+    | {chr(0x2065), chr(0xE0000)}  # reserved default-ignorables (unassigned)
+    | {chr(cp) for cp in range(0xFFF0, 0xFFF9)}
+    | {chr(cp) for cp in range(0xE0002, 0xE0020)}
+    | {chr(cp) for cp in range(0xE0080, 0xE0100)}
+    | {chr(cp) for cp in range(0xE01F0, 0xE0FFF + 1)}
 )
 
 
@@ -166,7 +182,10 @@ def _normalize(text: str) -> str:
 
 
 def line_leaks(line: str, patterns: Sequence[re.Pattern[str]] = LLM_LEAK_PATTERNS) -> bool:
-    """True when the normalised ``line`` matches any pattern. Defaults to the strict LLM-prose tier."""
+    """True when the normalised ``line`` matches any pattern. Defaults to the strict LLM-prose tier, where a line over
+    ``MAX_PROSE_LINE_CHARS`` is treated as leaking before anything else is done to it."""
+    if len(line) > MAX_PROSE_LINE_CHARS and tuple(patterns) == LLM_LEAK_PATTERNS:
+        return True
     text = _normalize(line)
     return any(p.search(text) is not None for p in patterns)
 
