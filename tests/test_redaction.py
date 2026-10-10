@@ -272,14 +272,21 @@ def test_fixed_strings_are_the_ruled_verbatim_values() -> None:
     )
     assert (
         MSG_PENDING_VERIFICATION
-        == "Pending verification: the credit check didn't complete. This learner is locked for 10 minutes "
-        "while the result is reconciled; please try again after that."
+        == "Pending verification: the credit check didn't complete. This learner's PAN is locked while the "
+        "result is reconciled against the provider; it will be available again once our team resolves it."
     )
     assert RATIONALE_RANKING_UNAVAILABLE == "Automatic ranking unavailable; this lender serves the learner's area"
     assert (
         WARN_NTC_RECENT
         == "No bureau file was found on {date}; a full report will most likely return nothing. Proceed?"
     )
+
+
+def test_pending_verification_copy_promises_no_time_based_retry() -> None:
+    # K2: lock expiry alone never re-admits the PAN; only the reconciliation review does.
+    assert "minute" not in MSG_PENDING_VERIFICATION
+    assert "try again" not in MSG_PENDING_VERIFICATION
+    assert "resolves it" in MSG_PENDING_VERIFICATION
 
 
 REFUSAL_CODES: tuple[Code, ...] = (

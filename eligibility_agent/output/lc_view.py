@@ -141,9 +141,11 @@ MSG_PAN_NOT_VERIFIED: Final[str] = (
     "PAN not verified. Correct the PAN with the learner and run the check again; no quota was used."
 )
 MSG_BUREAU_SERVICE_FAILURE: Final[str] = "Credit check couldn't complete, retry"  # PRD 10 verbatim (score and report)
+# K2: the PAN stays gated until the manual reconciliation review is resolved (lock expiry alone never re-admits), so the
+# copy must not promise a time-based retry. PRD 5.12 mandates only the phrase / status "pending verification".
 MSG_PENDING_VERIFICATION: Final[str] = (
-    "Pending verification: the credit check didn't complete. This learner is locked for 10 minutes "
-    "while the result is reconciled; please try again after that."
+    "Pending verification: the credit check didn't complete. This learner's PAN is locked while the "
+    "result is reconciled against the provider; it will be available again once our team resolves it."
 )
 MSG_OPENAI_FAILURE: Final[str] = "Couldn't generate a recommendation, retry"  # PRD 10 verbatim
 MSG_INTERNAL: Final[str] = "The check could not be completed automatically. Please raise it for manual review."
