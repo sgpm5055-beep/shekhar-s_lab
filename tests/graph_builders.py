@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 from langchain_core.runnables import RunnableConfig
 
@@ -78,6 +78,8 @@ class SpyRepo(MemoryRepo):
         self.log: list[str] = []
         self.fail_update_check: Exception | None = None
         self.fail_lenders: Exception | None = None
+        self.fail_review_insert: Exception | None = None
+        self.fail_create_lock: Exception | None = None
 
     def insert_consent(self, row: ConsentRow) -> None:
         self.log.append("insert_consent")
@@ -111,7 +113,17 @@ class SpyRepo(MemoryRepo):
 
     def insert_review_item(self, row: ReviewRow) -> None:
         self.log.append("insert_review_item")
+        if self.fail_review_insert is not None:
+            raise self.fail_review_insert
         super().insert_review_item(row)
+
+    def create_pan_lock(
+        self, pan_hash: str, kind: Literal["timeout", "daily_cap"], check_id: str | None, until: datetime
+    ) -> None:
+        self.log.append("create_pan_lock")
+        if self.fail_create_lock is not None:
+            raise self.fail_create_lock
+        super().create_pan_lock(pan_hash, kind, check_id, until)
 
     def lenders_for_pincodes(self, pincodes: Collection[str]) -> list[LenderRow]:
         self.log.append("lenders_for_pincodes")

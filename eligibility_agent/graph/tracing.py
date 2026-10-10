@@ -12,6 +12,14 @@
 PII rule (PRD 11, brief ruling 13): trace metadata carries ``check_id``, ``pan_hash``, the tier, the admission outcome and
 plans, and the billed / counted flags, NOTHING else; never the raw PAN, the learner's name or the mobile number. The key
 sets are frozen below and pinned by tests.
+
+Run PAYLOADS never leave the process (fix round 1, binding). Every node run's inputs / outputs are the graph state (raw
+PAN, mobile, names, score facts, prompts), so ``make_langsmith_client`` builds the client with ``hide_inputs`` /
+``hide_outputs`` callables that drop the payload entirely, and ``make_tracer`` binds a ``LangChainTracer`` to it.
+``invoke_config(tracer=...)`` attaches that tracer explicitly; with a ``LangChainTracer`` already among the callbacks,
+langchain-core adds no env-driven default tracer (whose default client would not hide anything). Metadata and tags are
+kept: they are the only thing a trace is for here. Residual (flagged): a child run's ``error`` string is not dropped by
+these hooks; the nodes' own exception texts are PII-free by construction.
 """
 
 from __future__ import annotations
@@ -21,7 +29,10 @@ from collections.abc import Mapping
 from typing import Any, Final, Protocol
 from uuid import UUID, uuid4
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tracers.langchain import LangChainTracer
+from langsmith import Client
 
 from eligibility_agent.graph.state import AdmissionDecision, Kind
 
@@ -31,8 +42,11 @@ __all__ = [
     "RECURSION_LIMIT",
     "RunUpdater",
     "base_tags",
+    "drop_payload",
     "finish_trace",
     "invoke_config",
+    "make_langsmith_client",
+    "make_tracer",
     "new_run_id",
     "trace_metadata",
 ]
@@ -55,6 +69,26 @@ class RunUpdater(Protocol):
     def update_run(self, run_id: UUID, *, tags: list[str] | None = ..., extra: dict[str, Any] | None = ...) -> None: ...
 
 
+def drop_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """The ``hide_inputs`` / ``hide_outputs`` hook: whatever a run carried, nothing of it is exported."""
+    del payload
+    return {}
+
+
+def make_langsmith_client(
+    *, api_key: str | None = None, api_url: str | None = None, client_cls: type[Client] = Client
+) -> Client:
+    """The ONE LangSmith client the service traces with: run inputs and outputs are dropped client-side, before any
+    upload; metadata and tags pass. ``api_key`` / ``api_url`` default to the LANGSMITH_* environment. ``client_cls``
+    exists for tests (a recording subclass keeps the real hiding logic and replaces only the send hooks)."""
+    return client_cls(api_key=api_key, api_url=api_url, hide_inputs=drop_payload, hide_outputs=drop_payload)
+
+
+def make_tracer(client: Client, *, project_name: str) -> LangChainTracer:
+    """The tracer every graph invocation attaches through ``invoke_config(tracer=...)`` when tracing is on."""
+    return LangChainTracer(client=client, project_name=project_name)
+
+
 def new_run_id(enabled: bool) -> UUID | None:
     """Pre-generate the root run id when tracing is on (``Settings.langsmith_tracing``); None when it is off."""
     return uuid4() if enabled else None
@@ -64,8 +98,17 @@ def base_tags(kind: Kind, lc_id: str) -> list[str]:
     return [f"tier:{kind}", f"lc:{lc_id}"]
 
 
-def invoke_config(*, kind: Kind, check_id: str, lc_id: str, pan_hash: str, run_id: UUID | None) -> RunnableConfig:
-    """The ``RunnableConfig`` for one graph invocation. Metadata is ``{check_id, pan_hash, tier}`` and nothing else."""
+def invoke_config(
+    *,
+    kind: Kind,
+    check_id: str,
+    lc_id: str,
+    pan_hash: str,
+    run_id: UUID | None,
+    tracer: BaseCallbackHandler | None = None,
+) -> RunnableConfig:
+    """The ``RunnableConfig`` for one graph invocation. Metadata is ``{check_id, pan_hash, tier}`` and nothing else.
+    ``tracer`` (from ``make_tracer``) is attached as the run's callback when tracing is on."""
     config: RunnableConfig = {
         "configurable": {"thread_id": check_id},
         "tags": base_tags(kind, lc_id),
@@ -74,6 +117,8 @@ def invoke_config(*, kind: Kind, check_id: str, lc_id: str, pan_hash: str, run_i
     }
     if run_id is not None:
         config["run_id"] = run_id
+    if tracer is not None:
+        config["callbacks"] = [tracer]
     return config
 
 

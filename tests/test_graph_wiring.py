@@ -6,7 +6,10 @@ that repo's sink, FakeRankModel, GraphDeps. Fixtures are synthetic (tests/graph_
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
@@ -15,6 +18,7 @@ import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langsmith import Client
 
 from eligibility_agent.db.repo import CheckRow, LenderRow, SurePassCallRow
 from eligibility_agent.graph import build, nodes, tracing
@@ -25,6 +29,7 @@ from eligibility_agent.graph.build import (
     RECOMPUTE_NODE_NAMES,
     CheckpointerConfigError,
     assert_checkpointer_isolated,
+    assert_checkpointer_schema,
     build_graph,
     check_checkpointer_dsn,
     make_checkpoint_serde,
@@ -680,17 +685,19 @@ def test_derive_falls_back_to_today_when_the_report_has_no_date(monkeypatch: pyt
         return real(accounts, declared=declared, kind=kind, anchor=anchor)
 
     monkeypatch.setattr(nodes, "derive_existing_emi", spy)
-    world = make_world(nothing_configured)
+    # 2026-10-10T20:00Z is 2026-10-11 01:30 IST: the UTC and IST calendar dates differ here.
+    world = make_world(nothing_configured, start=datetime(2026, 10, 10, 20, 0, tzinfo=T0.tzinfo))
     report = ReportFacts(
         band="720-780", score=745, is_ntc=False, report_date=None, open_accounts=[], past_due_total=0.0,
         written_off_or_settled=0, enquiries_30d=0, enquiries_90d=0, enquiries_180d=0, bureau_pincodes_12m=[],
     )
-    identity = Identity(pan_valid=True, status="valid", category="person", full_name=None, dob=None,
+    identity = Identity(pan_valid=True, status="valid", category="person", full_name=None, dob=date(2000, 10, 11),
                         aadhaar_linked=None, pan_pincode="560001", surepass_client_id=None)
     state: CheckState = {"kind": "full", "check_id": "chk-x", "identity": identity, "report": report, "monthly_income": 1.0}
     update = nodes.derive(state, cast(RunnableConfig, {}), world.deps)
-    assert anchors == [T0.date()]
+    assert anchors == [date(2026, 10, 11)]  # the IST date, like the adapters' anchors and pulled_on
     assert update["derived"].band == "720-780"
+    assert update["derived"].age_at_application_years == 26  # IST birthday reached (UTC would still say 25)
 
 
 def test_gate_input_is_built_from_lender_rows_with_policy_notes_and_list_pincodes() -> None:
@@ -812,7 +819,9 @@ def test_a_mid_graph_raise_escapes_and_fail_check_releases_the_lock() -> None:
     )
     assert (view.status, view.label) == ("service_failure", MSG_INTERNAL)
     assert not world.in_flight_held(pan_hash)  # ... so the error boundary helper releases it
-    assert world.row("chk-crash").status == "error"
+    row = world.row("chk-crash")
+    # route level: billed from the call log; counted is the documented residual (no admission context at the route)
+    assert (row.status, row.billed, row.counted_against_quota) == ("error", True, False)
 
 
 def test_redact_catches_builder_value_errors_and_records_a_guarded_error_row(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -825,8 +834,100 @@ def test_redact_catches_builder_value_errors_and_records_a_guarded_error_row(mon
     view = view_of(final)
     assert view.label == MSG_INTERNAL and final["lc_view"] is not None
     row = world.row("chk-redact")
-    assert row.status == "error" and row.billed is False
+    # K8: the billed 200 Score call still bills and still counts, on the error row too (node-level: admission known).
+    assert (row.status, row.billed, row.counted_against_quota) == ("error", True, True)
+    assert world.repo.quick_checks_used_today(LC_ID) == 1
+    assert (final["billed"], final["counted_against_quota"]) == (True, True)  # the trace matches the row
     assert not world.in_flight_held(pan_hash_of())
+
+
+def test_persist_writes_its_review_rows_before_the_terminal_update() -> None:
+    world = make_world(happy_quick, rank=FakeRankModel.invalid_twice())
+    run(world, check_state("quick", "chk-order-review"))
+    log = world.repo.log
+    assert log.index("insert_review_item") < log.index("update_check")
+
+
+def test_a_failing_review_insert_leaves_the_view_and_the_row_in_agreement() -> None:
+    world = make_world(happy_quick, rank=FakeRankModel.invalid_twice())  # persist owns an openai_failure row here
+    world.repo.fail_review_insert = RuntimeError("review_queue unavailable")
+    final = run(world, check_state("quick", "chk-review-down"))
+    view = view_of(final)
+    row = world.row("chk-review-down")
+    assert (view.status, view.code, view.label) == ("service_failure", None, MSG_INTERNAL)
+    assert (row.status, row.code) == ("error", None)  # never a service_failure/OPENAI_FAILURE row the LC never saw
+    assert (row.billed, row.counted_against_quota) == (True, True) == (final["billed"], final["counted_against_quota"])
+    assert world.reviews() == []
+    assert not world.in_flight_held(pan_hash_of())
+
+
+def test_bureau_timeout_writes_the_reconciliation_row_before_the_lock() -> None:
+    world = make_world(score_timeout)
+    run(world, check_state("quick", "chk-timeout-order"))
+    log = world.repo.log
+    assert log.index("insert_review_item") < log.index("create_pan_lock")
+
+
+def test_a_failing_timeout_lock_write_still_leaves_the_reconciliation_gate() -> None:
+    world = make_world(score_timeout)
+    world.repo.fail_create_lock = RuntimeError("pan_locks unavailable")
+    with pytest.raises(RuntimeError):
+        run(world, check_state("quick", "chk-lockdown"))
+    pan_hash = pan_hash_of()
+    assert [(r.kind, r.resolved_at) for r in world.reviews()] == [("timeout_reconciliation", None)]
+    view = nodes.fail_check(  # the route boundary
+        world.deps, check_id="chk-lockdown", kind="quick", lc_id=LC_ID, pan_hash=pan_hash, pan_last4="234F",
+        message="crash",
+    )
+    row = world.row("chk-lockdown")
+    assert (view.status, view.code, view.label) == ("service_failure", None, MSG_INTERNAL)
+    assert (row.status, row.billed) == ("error", True)  # the timeout row is conservatively billable
+    assert world.repo.get_active_locks(pan_hash) == []  # no timeout lock, no leaked in-flight lock ...
+    world.clock.advance(timedelta(minutes=1))
+    retry = run(world.with_surepass(nothing_configured), check_state("quick", "chk-after-lockdown"))
+    assert view_of(retry).code == "PAN_LOCKED"  # ... yet the unresolved review alone still gates the re-pull (K2)
+
+
+def test_full_check_report_reuse_cache_hit() -> None:
+    world = make_world(happy_full)
+    run(world, check_state("full", "chk-report-pull"))
+    world.clock.advance(timedelta(days=4))
+    hit = world.with_surepass(nothing_configured)
+    world.repo.log.clear()
+    final = run(hit, check_state("full", "chk-report-hit", opportunity_id="opp-graph-2"))
+    view = view_of(final)
+    assert final["transcript"] == FULL_PATH and hit.calls("chk-report-hit") == []
+    assert world.repo.log.count("fetch_raw") == 2  # PAN object + report object
+    assert view.status == "ok" and view.from_cache is True and view.checked_on == "2026-10-10"
+    assert view.label == "bureau report on 2026-10-01, income as declared"
+    row = world.row("chk-report-hit")
+    assert (row.billed, row.counted_against_quota, row.is_refresh) == (False, False, False)
+
+
+def test_a_cache_hit_regates_against_the_currently_published_lenders() -> None:
+    world = make_world(happy_quick)
+    first_top = view_of(run(world, check_state("quick", "chk-gate-1"))).top_lender
+    assert first_top is not None and first_top.id == "L1"
+    key = ("L1", 1)
+    world.repo._lenders[key] = dataclasses.replace(world.repo._lenders[key], published=False)  # admin unpublishes L1
+    final = run(world.with_surepass(nothing_configured), check_state("quick", "chk-gate-2"))
+    assert view_of(final).from_cache is True
+    assert [g.id for g in final["gated_lenders"]] == ["L2", "L3"]
+    top = view_of(final).top_lender
+    assert top is not None and top.id != "L1"
+
+
+def test_a_quick_check_is_served_from_the_report_sourced_score_row() -> None:
+    world = make_world(happy_full)
+    run(world, check_state("full", "chk-report-first"))
+    score_row = world.repo.get_score_cache(pan_hash_of())
+    assert score_row is not None and score_row.source == "report"
+    final = run(world.with_surepass(nothing_configured), check_state("quick", "chk-quick-from-report"))
+    view = view_of(final)
+    assert final["score"].source == "report" and final["score"].band == "720-780"  # read from the report envelope
+    assert view.status == "ok" and view.from_cache is True and view.checked_on == "2026-10-10"
+    row = world.row("chk-quick-from-report")
+    assert (row.billed, row.counted_against_quota) == (False, False)
 
 
 def test_internal_carries_no_raw_pan_mobile_or_names() -> None:
@@ -921,6 +1022,18 @@ def test_recompute_outcomes_not_found_not_recomputable_raw_unavailable() -> None
     assert world.repo.get_check("n3") is None  # no row for a refused recompute
 
 
+def test_recompute_never_answers_ok_without_its_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    world = make_world(happy_quick)
+    run(world, check_state("quick", "chk-norows"))
+    world.repo.delete_expired_cache_rows(T0 + timedelta(days=400))  # drop every cache row
+    def wrongly_admitted(*args: object) -> str:
+        return "ok"
+
+    monkeypatch.setattr(build, "admit_recompute", wrongly_admitted)  # a policy that wrongly admitted
+    assert seed_recompute(world.deps, original_check_id="chk-norows", new_check_id="n4", monthly_income=None,
+                          existing_emi_declared=None) == ("raw_unavailable", None)  # never a contradictory ("ok", None)
+
+
 # =========================================================================== serde + checkpointer (K21)
 
 
@@ -986,6 +1099,73 @@ class _StubConnection:
     def execute(self, query: str) -> _StubCursor:
         self.sql.append(query)
         return _StubCursor(self.row)
+
+
+def test_pre_setup_schema_assertion_requires_the_checkpointer_schema() -> None:
+    good = _StubConnection({"current_schema": "checkpointer"})
+    assert_checkpointer_schema(good)
+    assert "current_schema()" in good.sql[0]
+    for row in ({"current_schema": "public"}, None):
+        with pytest.raises(CheckpointerConfigError):
+            assert_checkpointer_schema(_StubConnection(row))
+
+
+class _StubPool:
+    def __init__(self, row: dict[str, Any], events: list[str], **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.events = events
+        self.row = row
+
+    def connection(self) -> Any:
+        pool = self
+
+        class _Ctx:
+            def __enter__(self) -> _StubConnection:
+                pool.events.append("connection")
+                return _StubConnection(pool.row)
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+        return _Ctx()
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+def _stub_factory(monkeypatch: pytest.MonkeyPatch, row: dict[str, Any]) -> list[str]:
+    import langgraph.checkpoint.postgres as lg_postgres
+    import psycopg_pool
+
+    events: list[str] = []
+
+    class _StubSaver:
+        def __init__(self, conn: Any, serde: Any = None) -> None:
+            events.append("saver")
+
+        def setup(self) -> None:
+            events.append("setup")
+
+    monkeypatch.setenv("LANGGRAPH_STRICT_MSGPACK", "true")
+    def stub_pool(**kwargs: Any) -> _StubPool:
+        return _StubPool(row, events, **kwargs)
+
+    monkeypatch.setattr(psycopg_pool, "ConnectionPool", stub_pool)
+    monkeypatch.setattr(lg_postgres, "PostgresSaver", _StubSaver)
+    return events
+
+
+def test_checkpointer_factory_checks_the_schema_before_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _stub_factory(monkeypatch, {"current_schema": "checkpointer", "public_clear": True})
+    make_postgres_checkpointer("postgresql://svc:pw@localhost:5432/postgres")
+    assert events == ["connection", "saver", "setup", "connection"]  # schema check -> setup -> isolation check
+
+
+def test_checkpointer_factory_never_runs_setup_on_the_wrong_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _stub_factory(monkeypatch, {"current_schema": "public", "public_clear": True})
+    with pytest.raises(CheckpointerConfigError):
+        make_postgres_checkpointer("postgresql://svc:pw@localhost:5432/postgres")
+    assert "setup" not in events and events[-1] == "close"  # public.checkpoints is never created, even transiently
 
 
 def test_checkpointer_isolation_assertion_passes_only_on_the_checkpointer_schema() -> None:
@@ -1082,6 +1262,54 @@ def test_finish_trace_is_a_no_op_without_a_client_and_never_raises(caplog: pytes
     refused = tracing.trace_metadata(kind="quick", check_id="c", pan_hash="h",
                                      final_state={"admission": AdmissionDecision(code="IN_FLIGHT")})
     assert (refused["admission"], refused["billed"]) == ("refused", False)
+
+
+class RecordingClient(Client):
+    """A real langsmith Client (so its hide_inputs / hide_outputs logic runs) whose two send hooks record the
+    post-hiding payload instead of doing I/O: exactly what would leave the process."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(auto_batch_tracing=False, **kwargs)  # pyright: ignore[reportUnknownMemberType]
+        self.exported: list[dict[str, Any]] = []
+
+    def _create_run(self, run_create: dict[str, Any], **kwargs: Any) -> None:
+        self.exported.append(copy.deepcopy(run_create))
+
+    def _update_run(self, run_update: dict[str, Any], **kwargs: Any) -> None:
+        self.exported.append(copy.deepcopy(run_update))
+
+
+_STANDALONE_SCORE = re.compile(r"(?<![0-9A-Za-z])745(?![0-9A-Za-z])")
+
+
+def test_traced_runs_export_metadata_but_never_payloads() -> None:
+    world = make_world(happy_quick)
+    client = tracing.make_langsmith_client(
+        api_key="test-key", api_url="http://langsmith.invalid", client_cls=RecordingClient
+    )
+    assert isinstance(client, RecordingClient)
+    tracer = tracing.make_tracer(client, project_name="eligibility-agent-test")
+    run_id = tracing.new_run_id(True)
+    config = tracing.invoke_config(kind="quick", check_id="chk-traced", lc_id=LC_ID, pan_hash=pan_hash_of(),
+                                   run_id=run_id, tracer=tracer)
+    final = invoke(build_graph("quick", world.deps), check_state("quick", "chk-traced"), config)
+    tracer.wait_for_futures()
+    tracing.finish_trace(client, run_id=run_id, kind="quick", lc_id=LC_ID, check_id="chk-traced",
+                         pan_hash=pan_hash_of(), final_state=final)
+    assert view_of(final).status == "ok"
+
+    exported = client.exported
+    assert len(exported) >= 2 * len(FULL_PATH)  # the root, every node and every router: posted and patched
+    forbidden = (PAN_OK, "9876543210", LC_TYPED_NAME, "RAVI TESTKUMAR", "1998-04-12", "720-780", "650-720",
+                 "780+", "<650")
+    for payload in exported:
+        assert payload.get("inputs") in (None, {}) and payload.get("outputs") in (None, {})
+        visible = repr({k: payload.get(k) for k in ("inputs", "outputs", "extra", "tags", "name", "events")})
+        for literal in forbidden:
+            assert literal not in visible, (literal, payload.get("name"))
+        assert _STANDALONE_SCORE.search(visible) is None, payload.get("name")
+    root = [p for p in exported if p.get("id") == run_id and p.get("extra")]
+    assert root and all(p["extra"]["metadata"]["pan_hash"] == pan_hash_of() for p in root)
 
 
 def test_new_check_state_seeds_counters_and_no_derived_keys() -> None:

@@ -16,9 +16,9 @@ Load-bearing orderings and owners (controller rulings, each pinned in tests/test
 * Nodes key off ``code`` / ``admission``, never off a refusal's plans (refusals carry ``'reuse'`` plans).
 * Cache reuse (K5): ``repo.fetch_raw(row.storage_key)`` + the adapter on CURRENT code, every time. No derived columns.
   A Report pull upserts BOTH ``report_cache`` and ``score_cache(source='report')`` pointing at the same raw object.
-* Bureau TIMEOUT (K1/K2): the client already logged the billable sink row; this node creates the 10-minute timeout lock
-  AND the unresolved ``timeout_reconciliation`` review row -> ``pending_verification`` with code None -> persist. A
-  PAN-endpoint timeout is a plain service failure (no lock).
+* Bureau TIMEOUT (K1/K2): the client already logged the billable sink row; this node writes the unresolved
+  ``timeout_reconciliation`` review row FIRST (it alone gates re-pulls) and then the 10-minute timeout lock ->
+  ``pending_verification`` with code None -> persist. A PAN-endpoint timeout is a plain service failure (no lock).
 * Review-row owners (K11): admission -> ``pan_daily_cap`` / ``pan_change_manager``; bureau node ->
   ``timeout_reconciliation``; the node that sees a SurePass auth failure -> ``surepass_auth`` + ``logger.critical``;
   persist -> ``openai_failure`` / ``safety_demoted_all`` / ``not_fundable_pattern`` / ``model_review_flags``.
@@ -28,14 +28,17 @@ Load-bearing orderings and owners (controller rulings, each pinned in tests/test
 * Redact (T9): ``build_lc_view(state, RedactionContext)`` owns confidence and headline; the node reads them back from
   the view. A builder ``ValueError`` becomes the internal-error view plus a guarded error row, so ``lc_view`` is ALWAYS
   set.
-* Persist / persist_refusal: ONE guarded terminal ``update_check``; billed / counted come from
-  ``policy.compute_billed`` / ``policy.compute_counted_against_quota``; ANY exception (not just ValueError) becomes a
-  guarded error row and the error view; the in-flight lock is released holder-only in ``finally`` on every terminal.
-  Both blank the raw ``pan`` / ``name`` / ``mobile`` in the final state (request scope only). An exception raised
-  BEFORE a terminal node escapes ``graph.invoke``; ``fail_check`` is the route boundary's helper for that case.
+* Persist / persist_refusal: ONE guarded terminal ``update_check``, always the LAST write (persist's review rows go
+  before it); billed / counted come from ``policy.compute_billed`` / ``policy.compute_counted_against_quota``; ANY
+  exception (not just ValueError) becomes a guarded error row and the error view; the in-flight lock is released
+  holder-only in ``finally`` on every terminal. Error rows keep the true billed / counted flags (K8): they are patched
+  while the row is still running, before ``record_check_error``. Both terminals blank the raw ``pan`` / ``name`` /
+  ``mobile`` in the final state (request scope only). An exception raised BEFORE a terminal node escapes
+  ``graph.invoke``; ``fail_check`` is the route boundary's helper for that case.
 
-PII: no node logs, stores in ``internal`` or traces the raw PAN, the mobile or a name. Log lines carry ``check_id`` and
-exception TYPES only.
+PII: no node logs or stores in ``internal`` the raw PAN, the mobile or a name; log lines carry ``check_id`` and
+exception TYPES only. Run payloads DO carry them (node inputs / outputs are the state), so tracing exports metadata
+only: ``graph/tracing.py``'s tracer runs on a client whose ``hide_inputs`` / ``hide_outputs`` drop every payload.
 """
 
 from __future__ import annotations
@@ -292,11 +295,30 @@ def _release_in_flight(deps: GraphDeps, pan_hash: str | None, check_id: str | No
         logger.error("in-flight lock release failed for check_id=%s (%s)", check_id, type(exc).__name__)
 
 
-def _record_error(deps: GraphDeps, state: CheckState, message: str) -> LcView:
-    """Guarded error row (``record_check_error``: update-if-running, else insert ``error``) + the internal-error view.
-    Best effort: a failing repo is logged, never raised."""
+def _record_error(deps: GraphDeps, state: CheckState, message: str) -> tuple[LcView, bool, bool]:
+    """Guarded error row + the internal-error view; returns ``(view, billed, counted)`` as written on the row.
+
+    K8 (fix round 1): spend is status-independent, so WHILE the row is still running it is first patched with
+    ``billed = policy.compute_billed(calls)`` and, when the admission decision is in state (every node-level path),
+    ``counted = policy.compute_counted_against_quota(...)``; only then does ``record_check_error`` (update-if-running,
+    else insert ``error``) flip it, keeping both flags. Without a decision (the route-level ``fail_check``) counted
+    stays False. Best effort: a failing repo is logged, never raised; the flags returned are the ones the row holds.
+    """
     check_id = state.get("check_id") or ""
     kind: Kind = state.get("kind") or "quick"
+    billed = counted = False
+    if check_id:
+        try:
+            calls = deps.repo.surepass_calls_for_check(check_id)
+            spent = compute_billed(calls)
+            decision = state.get("admission")
+            would_count = decision is not None and compute_counted_against_quota(
+                kind=kind, counts_against_quota=decision.counts_against_quota, calls=calls
+            )
+            deps.repo.update_check(check_id, {"billed": spent, "counted_against_quota": would_count})
+            billed, counted = spent, would_count
+        except Exception as exc:
+            logger.error("billing patch before the error row failed for check_id=%s (%s)", check_id, type(exc).__name__)
     try:
         deps.repo.record_check_error(
             check_id=check_id,
@@ -308,20 +330,27 @@ def _record_error(deps: GraphDeps, state: CheckState, message: str) -> LcView:
         )
     except Exception as exc:
         logger.error("record_check_error failed for check_id=%s (%s)", check_id, type(exc).__name__)
-    return build_error_lc_view(check_id=check_id, kind=kind)
+    return build_error_lc_view(check_id=check_id, kind=kind), billed, counted
 
 
 def fail_check(
     deps: GraphDeps, *, check_id: str, kind: Kind, lc_id: str, pan_hash: str, pan_last4: str, message: str
 ) -> LcView:
-    """The error-boundary helper for an exception that escaped the graph BEFORE persist ran (Task 12's route boundary).
+    """The route boundary's helper for an exception that ESCAPED ``graph.invoke`` before a terminal node ran.
 
-    Writes the guarded error row and releases this check's in-flight lock (holder-only, so it is safe whether or not
-    the run ever acquired it), then returns the internal-error view. Never raises.
+    Use it only once ``graph.invoke`` has actually returned or raised. NEVER on a route timeout: the graph thread may
+    still be mid-call (a SurePass or model request in flight), so its in-flight lock must be left to expire at its TTL
+    rather than be released under a live run.
+
+    Patches ``billed`` from the call log while the row is still running, writes the guarded error row, and releases this
+    check's in-flight lock (holder-only, so safe whether or not the run ever acquired it); returns the internal-error
+    view. Never raises. RESIDUAL: the route has no admission decision, so ``counted_against_quota`` stays False here even
+    if a counting Score call happened (the call log keeps the spend; node-level error paths do count).
     """
     state: CheckState = {"check_id": check_id, "kind": kind, "lc_id": lc_id, "pan_hash": pan_hash, "pan_last4": pan_last4}
     try:
-        return _record_error(deps, state, message)
+        view, _, _ = _record_error(deps, state, message)
+        return view
     finally:
         _release_in_flight(deps, pan_hash, check_id)
 
@@ -470,7 +499,8 @@ def admission(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> Sta
 
     # 8. directives.
     if decision.create_daily_cap_lock:
-        repo.create_pan_lock(pan_hash, "daily_cap", check_id, next_ist_midnight(now))
+        # Review row first, then the lock (same order as the timeout path): the count-based cap keeps refusing on its
+        # own until IST midnight, so a failed lock write still leaves both the gate and the review signal.
         _insert_review(
             repo,
             now=now,
@@ -479,6 +509,7 @@ def admission(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> Sta
             kind=decision.review_reason or "pan_daily_cap",
             reason="per-PAN daily cap of billed bureau calls reached; PAN locked until the next IST midnight",
         )
+        repo.create_pan_lock(pan_hash, "daily_cap", check_id, next_ist_midnight(now))
     if decision.code is None and opportunity_id and pan_change in ("first_pan", "record_correction"):
         # Events are recorded only for an ADMITTED full check: a refused attempt made no pull, so it neither marks the
         # first PAN nor spends the one correction (PRD 5.13).
@@ -546,8 +577,7 @@ def persist_refusal(state: CheckState, config: RunnableConfig, deps: GraphDeps) 
         deps.repo.update_check(_check_id(state), patch)
     except Exception as exc:  # ANY exception, not just ValueError (T2 note): guarded error row + the error view
         logger.error("persist_refusal failed for check_id=%s (%s)", check_id, type(exc).__name__)
-        view = _record_error(deps, state, f"persist_refusal: {type(exc).__name__}")
-        billed = counted = False
+        view, billed, counted = _record_error(deps, state, f"persist_refusal: {type(exc).__name__}")
     finally:
         _release_in_flight(deps, pan_hash, check_id)
     return {
@@ -713,9 +743,10 @@ def bureau_pull(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> S
         else:
             result = deps.surepass.experian_report(check_id, pan_hash, name=name, mobile=mobile, pan=pan)
     except SurePassTimeout as exc:
-        # K2: spend unknown. The client already wrote the billable sink row; lock the PAN for 10 minutes AND open the
-        # reconciliation gate (lock expiry alone never re-admits a billed pull) -> pending_verification, code None (K1).
-        repo.create_pan_lock(pan_hash, "timeout", check_id, now + TIMEOUT_LOCK_TTL)
+        # K2: spend unknown. The client already wrote the billable sink row; open the reconciliation gate (lock expiry
+        # alone never re-admits a billed pull) and lock the PAN for 10 minutes -> pending_verification, code None (K1).
+        # The unresolved review row is written FIRST (fix round 1): it alone gates every re-pull (QK7 / FL6), so if the
+        # lock write then fails the stronger invariant already holds.
         _insert_review(
             repo,
             now=now,
@@ -724,6 +755,7 @@ def bureau_pull(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> S
             kind="timeout_reconciliation",
             reason=f"{exc.endpoint} timed out (spend unknown); reconcile against the SurePass console before any re-pull",
         )
+        repo.create_pan_lock(pan_hash, "timeout", check_id, now + TIMEOUT_LOCK_TTL)
         view = build_failure_lc_view(
             check_id=check_id,
             kind=kind,
@@ -820,7 +852,7 @@ def derive(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> StateU
     identity = _identity(state)
     score = state.get("score")
     report = state.get("report")
-    today = deps.now().date()
+    today = ist_date(deps.now())  # the IST calendar date, like the adapters' anchors and pulled_on (fix round 1)
     band = _band(score, report)
     # T6 ruling: the EMI tenure maths runs from the report date, or today when the report carries none.
     anchor = report.report_date if report is not None and report.report_date is not None else today
@@ -1002,7 +1034,7 @@ def redact(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> StateU
         errors.append(f"redact: {type(exc).__name__}: {exc}")
         view = build_error_lc_view(check_id=state.get("check_id") or "", kind=state.get("kind") or "quick")
     if _is_error_view(view):
-        view = _record_error(deps, state, errors[0] if errors else "redact: unhandled view state")
+        view, _, _ = _record_error(deps, state, errors[0] if errors else "redact: unhandled view state")
     return {
         "lc_view": view,
         "status": view.status,
@@ -1087,9 +1119,13 @@ def _internal(
 
 
 def persist(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> StateUpdate:
-    """The terminal for every admitted run: ONE guarded ``update_check`` (status / code from the view; billed / counted
-    from the policy formulas, status-independent per K8; is_refresh from the decision), then persist's review rows.
-    ANY exception becomes a guarded error row + the error view; the in-flight lock is released in ``finally``."""
+    """The terminal for every admitted run: persist's review rows, THEN the ONE guarded ``update_check`` (status / code
+    from the view; billed / counted from the policy formulas, status-independent per K8; is_refresh from the decision).
+
+    Write order (fix round 1): the terminal update is the LAST write, so any earlier failure (a review insert included)
+    leaves the row running for the error path to flip, and the LC's view always matches the final row. ANY exception
+    becomes a guarded error row carrying the true billed / counted flags + the error view; the in-flight lock is
+    released in ``finally``."""
     del config
     check_id = state.get("check_id")
     pan_hash = state.get("pan_hash")
@@ -1098,34 +1134,37 @@ def persist(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> State
     try:
         if view is None:
             raise ValueError("persist reached without an lc_view")
-        if not _is_error_view(view):  # an error view's row was already written (guarded) where it was produced
-            repo = deps.repo
+        repo = deps.repo
+        if _is_error_view(view):
+            # The row was already flipped to 'error' (with its billed / counted flags) where the view was produced;
+            # report what it holds so the trace agrees with the row.
+            row = repo.get_check(_check_id(state))
+            billed, counted = (row.billed, row.counted_against_quota) if row is not None else (False, False)
+        else:
             decision = _admission(state)
             kind = _kind(state)
             calls = repo.surepass_calls_for_check(_check_id(state))
-            billed = compute_billed(calls)
-            counted = compute_counted_against_quota(
-                kind=kind, counts_against_quota=decision.counts_against_quota, calls=calls
-            )
             patch: CheckPatch = {
                 "status": view.status,
                 "code": view.code,
-                "billed": billed,
-                "counted_against_quota": counted,
+                "billed": compute_billed(calls),
+                "counted_against_quota": compute_counted_against_quota(
+                    kind=kind, counts_against_quota=decision.counts_against_quota, calls=calls
+                ),
                 "is_refresh": decision.is_refresh,
                 "lc_view": view.model_dump(mode="json"),
                 "internal": _internal(deps, state, view, calls, node="persist"),
                 "langsmith_run_id": state.get("langsmith_run_id"),
             }
-            repo.update_check(_check_id(state), patch)
             now = deps.now()
             for review_kind, reason in _review_items(state, view):
                 _insert_review(repo, now=now, check_id=_check_id(state), pan_hash=_pan_hash(state), kind=review_kind,
                                reason=reason)
+            repo.update_check(_check_id(state), patch)
+            billed, counted = patch["billed"], patch["counted_against_quota"]
     except Exception as exc:  # ANY exception, not just ValueError (T2 note)
         logger.error("persist failed for check_id=%s (%s)", check_id, type(exc).__name__)
-        view = _record_error(deps, state, f"persist: {type(exc).__name__}")
-        billed = counted = False
+        view, billed, counted = _record_error(deps, state, f"persist: {type(exc).__name__}")
     finally:
         _release_in_flight(deps, pan_hash, check_id)
     return {

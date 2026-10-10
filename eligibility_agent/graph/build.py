@@ -42,7 +42,7 @@ from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMiss
 from langgraph.graph.state import CompiledStateGraph  # pyright: ignore[reportMissingTypeStubs]
 from pydantic import BaseModel
 
-from eligibility_agent.db.repo import CheckRow, RawUnavailable, Repo
+from eligibility_agent.db.repo import CheckRow, RawUnavailable, ReportCacheRow, Repo, ScoreCacheRow
 from eligibility_agent.graph import nodes
 from eligibility_agent.graph import state as state_module
 from eligibility_agent.graph.llm import RankModel
@@ -80,6 +80,7 @@ __all__ = [
     "CompiledGraph",
     "GraphDeps",
     "assert_checkpointer_isolated",
+    "assert_checkpointer_schema",
     "bind",
     "build_graph",
     "build_recompute_graph",
@@ -356,28 +357,26 @@ def seed_recompute(
     pan_row = repo.get_pan_record(original.pan_hash)
     score_row = repo.get_score_cache(original.pan_hash) if kind == "quick" else None
     report_row = repo.get_report_cache(original.pan_hash) if kind == "full" else None
-    bureau_present = score_row is not None if kind == "quick" else report_row is not None
-    outcome = admit_recompute(original.status, original.code, kind, pan_row is not None, bureau_present)
-    if outcome != "ok" or pan_row is None:
+    bureau_row: ScoreCacheRow | ReportCacheRow | None = score_row if kind == "quick" else report_row
+    outcome = admit_recompute(original.status, original.code, kind, pan_row is not None, bureau_row is not None)
+    if outcome != "ok":
         return outcome, None
+    if pan_row is None or bureau_row is None:
+        # Type narrowing only: R3 / R4 already answered raw_unavailable for a missing row. Should a policy change ever
+        # admit one anyway, the answer stays raw_unavailable, never a contradictory ("ok", None).
+        return "raw_unavailable", None
     score: ScoreFacts | None = None
     report: ReportFacts | None = None
     try:
         identity = identity_from_envelope(repo.fetch_raw(pan_row.storage_key))
-        if score_row is not None:
-            score = score_facts_from_envelope(
-                repo.fetch_raw(score_row.storage_key), pulled_on=ist_date(score_row.fetched_at), source=score_row.source
-            )
-            fetched_at, expires_at = score_row.fetched_at, score_row.expires_at
-        elif report_row is not None:
-            report = report_facts_from_envelope(
-                repo.fetch_raw(report_row.storage_key), today=ist_date(report_row.fetched_at)
-            )
-            fetched_at, expires_at = report_row.fetched_at, report_row.expires_at
-        else:  # unreachable: admit_recompute already required the bureau row
-            return "raw_unavailable", None
+        bureau_raw = repo.fetch_raw(bureau_row.storage_key)
     except RawUnavailable:
         return "raw_unavailable", None
+    if isinstance(bureau_row, ScoreCacheRow):
+        score = score_facts_from_envelope(bureau_raw, pulled_on=ist_date(bureau_row.fetched_at), source=bureau_row.source)
+    else:
+        report = report_facts_from_envelope(bureau_raw, today=ist_date(bureau_row.fetched_at))
+    fetched_at, expires_at = bureau_row.fetched_at, bureau_row.expires_at
 
     now = deps.now()
     repo.insert_check(
@@ -462,6 +461,7 @@ ISOLATION_SQL: Final[str] = (
     "SELECT to_regclass('public.checkpoints') IS NULL AS public_clear, current_schema() AS current_schema"
 )
 CHECKPOINTER_SCHEMA: Final[str] = "checkpointer"
+SCHEMA_SQL: Final[str] = "SELECT current_schema() AS current_schema"
 
 
 class CheckpointerConfigError(RuntimeError):
@@ -510,6 +510,17 @@ class _SqlConnection(Protocol):
     def execute(self, query: str) -> _Cursor: ...
 
 
+def assert_checkpointer_schema(conn: _SqlConnection) -> None:
+    """PRE-setup assertion: the session already resolves to the ``checkpointer`` schema (the role's search_path took
+    effect), so ``setup()`` can never create ``public.checkpoints``, not even transiently."""
+    row = conn.execute(SCHEMA_SQL).fetchone()
+    current = None if row is None else row.get("current_schema")
+    if current != CHECKPOINTER_SCHEMA:
+        raise CheckpointerConfigError(
+            f"checkpointer role search_path is not '{CHECKPOINTER_SCHEMA}' (got {current!r}); refusing to run setup()"
+        )
+
+
 def assert_checkpointer_isolated(conn: _SqlConnection) -> None:
     """Post-setup assertion: the checkpoint tables must NOT be visible in ``public`` (PostgREST-exposed; blobs carry the
     raw PAN) and the session's schema must be ``checkpointer`` (the role's search_path took effect)."""
@@ -526,8 +537,8 @@ def make_postgres_checkpointer(
     db_url: str, *, min_size: int = 1, max_size: int = 5
 ) -> tuple[PostgresSaver, ConnectionPool[Any]]:
     """The production saver over a manually built pool (``from_conn_string`` hard-codes ``prepare_threshold=0``, which
-    breaks behind poolers). Every precondition is checked BEFORE any connection is made; the caller owns
-    ``pool.close()`` at shutdown."""
+    breaks behind poolers). Order: env + DSN preconditions (no connection yet) -> pool -> schema assertion -> saver +
+    ``setup()`` -> isolation assertion. Any failure closes the pool; the caller owns ``pool.close()`` at shutdown."""
     if os.environ.get(STRICT_MSGPACK_ENV, "").strip().lower() not in _TRUTHY:
         raise CheckpointerConfigError(f"{STRICT_MSGPACK_ENV}=true is required before a checkpointer is built")
     check_checkpointer_dsn(db_url)
@@ -544,6 +555,8 @@ def make_postgres_checkpointer(
         kwargs={"autocommit": True, "prepare_threshold": None, "row_factory": dict_row},
     )
     try:
+        with pool.connection() as conn:
+            assert_checkpointer_schema(cast(_SqlConnection, conn))  # BEFORE setup: never create public.checkpoints
         saver = PostgresSaver(cast(Any, pool), serde=make_checkpoint_serde())
         saver.setup()  # idempotent migrations; requires autocommit
         with pool.connection() as conn:
