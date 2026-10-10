@@ -48,5 +48,5 @@ pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
 executionEnvironments = [
-    { root = "tests", reportPrivateUsage = false },
+    { root = "tests", extraPaths = ["."], reportPrivateUsage = false },
 ]
