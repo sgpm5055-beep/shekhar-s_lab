@@ -116,17 +116,21 @@ STANDALONE_SCORE_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(?<!\d[.,])[3-
 # "No account list in any LC-facing string" (PRD 12 no_leak). Three alternatives:
 #   1. an account-number label followed by its value: "account number 1234", "account numbers: 1234", "a/c no123",
 #      "acct # 99". ``no`` must not be followed by a letter, so "account normally serviced" is prose, not a label, while
-#      "no123" / "numbers" still are. The gap between label and value is bounded ({0,8}) so a long run of whitespace or
-#      dashes cannot make the scan quadratic;
-#   2. a masked id: "XXXX1234", "****1234", "xxxx-1234", "XXXX1234abc". The lookbehind (not \b, which can never anchor
-#      on '*') also forbids a preceding '*' so a long run of asterisks is scanned once, not once per position;
+#      "no123" / "numbers" still are. The gap between label and value is ONE class of any width, ``[\s:\-]*`` (a padded
+#      gap must not hide the value; a single class backtracks linearly, unlike the two adjacent ``\s*`` groups it
+#      replaced);
+#   2. a masked id: "XXXX1234", "****1234", "xxxx-1234", "XXXX1234abc" and masks glued to a word ("A/C****1234",
+#      "card****1234", "Max****1234"). A match may start where no word character precedes it (so "IDxxxx1234" and
+#      "Max1234" are not masks) OR at an asterisk (an asterisk is never part of a word). The run is bounded to 32
+#      characters so the scan is linear even on a hostile alternating run (an unbounded run is quadratic: every
+#      asterisk after a letter is a fresh start); a longer asterisk run is still caught from a later start inside it;
 #   3. any bare run of 9 or more digits, with NO word-boundary anchors: "LN00123456789", "acct_123456789" and
 #      "123456789abc" are as much account numbers as a lone run, and no legitimate prose has 9 adjacent digits (amounts
 #      are grouped and short, dates are 4-2-2). The dossier capped this at 18 digits and anchored it with \b.
 # The bare word "account" is deliberately NOT banned ("An account last updated <date>" is mandated copy).
 ACCOUNT_ID_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:a/?c|acct|account)\s*(?:no(?![a-z])\.?|numbers?|#)[\s:\-]{0,8}\S+"
-    r"|(?<![\w*])[x*]{2,}[\s-]?\d{3,}"
+    r"\b(?:a/?c|acct|account)\s*(?:no(?![a-z])\.?|numbers?|#)[\s:\-]*\S+"
+    r"|(?:(?<!\w)|(?=\*))[x*]{2,32}[\s-]?\d{3,}"
     r"|\d{9,}",
     re.IGNORECASE,
 )
@@ -135,17 +139,30 @@ LLM_LEAK_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (BUREAU_TERM_RE, STANDAL
 GLOBAL_LEAK_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (BUREAU_NAME_RE, STANDALONE_SCORE_RE, ACCOUNT_ID_RE)
 
 
-# Invisible / formatting characters that split a word or a number without changing how it reads: zero-width space,
-# non-joiner, joiner, LRM / RLM (U+200B-U+200F), word joiner (U+2060), BOM / zero-width no-break space (U+FEFF) and the
-# soft hyphen (U+00AD). The ruled set was U+200B-200D, U+FEFF and U+00AD; the directional marks and the word joiner are
-# the same kind of character and are included.
-_INVISIBLE_RE: Final[re.Pattern[str]] = re.compile("[\u200b-\u200f\u2060\ufeff\u00ad]")
+# Characters that split a word or a number without changing how it reads. Every Unicode format character (category Cf:
+# zero-width space / joiners, bidi marks and isolates, word joiner, invisible operators, BOM, soft hyphen, tags, ...) is
+# stripped, plus the default-ignorable code points that are NOT Cf: combining grapheme joiner (U+034F), the Hangul and
+# Khmer fillers, Mongolian free variation selectors, the variation selectors and the halfwidth Hangul filler.
+_INVISIBLE_NON_CF: Final[frozenset[str]] = frozenset(
+    {"\u034f", "\u115f", "\u1160", "\u17b4", "\u17b5", "\u3164", "\uffa0"}
+    | {chr(cp) for cp in range(0x180B, 0x180E)}  # U+180B-U+180D (U+180E is Cf)
+    | {"\u180f"}
+    | {chr(cp) for cp in range(0xFE00, 0xFE10)}  # variation selectors U+FE00-U+FE0F
+    | {chr(cp) for cp in range(0xE0100, 0xE01F0)}  # variation selectors supplement
+)
+
+
+def _is_invisible(ch: str) -> bool:
+    return unicodedata.category(ch) == "Cf" or ch in _INVISIBLE_NON_CF
 
 
 def _normalize(text: str) -> str:
-    """The text the patterns actually see: NFKC (fullwidth to ASCII, compatibility forms folded), then the invisible
-    characters removed. Used for decisions only; kept text is never replaced by this copy."""
-    return _INVISIBLE_RE.sub("", unicodedata.normalize("NFKC", text))
+    """The text the patterns actually see: NFKC (fullwidth to ASCII, compatibility forms folded), then every invisible
+    character removed. Used for decisions only; kept text is never replaced by this copy. Pure ASCII (no format
+    character is ASCII, and NFKC leaves ASCII alone) is returned untouched."""
+    if text.isascii():
+        return text
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text) if not _is_invisible(ch))
 
 
 def line_leaks(line: str, patterns: Sequence[re.Pattern[str]] = LLM_LEAK_PATTERNS) -> bool:

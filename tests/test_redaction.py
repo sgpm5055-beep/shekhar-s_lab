@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 import time
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
+from eligibility_agent.derive.emi import _STALE_CONFIRM_PREFIX
 from eligibility_agent.graph.state import Code
 from eligibility_agent.output import lc_view as lc_view_module
 from eligibility_agent.output.lc_view import (
@@ -191,7 +194,30 @@ ACCOUNT_DROP = [
     # same escape class on the masked-id branch
     "XXXX1234abc",
     "xxxx1234_ref",
+    # fix round 2 (1): masks GLUED to a preceding word (the round-1 lookbehind dropped these)
+    "A/C****1234",
+    "ending****1234",
+    "acct****1234",
+    "Loan****1234",
+    "card****1234",
+    "Max****1234",  # glued to a word that itself ends in x
+    "ID**xx1234",
+    # fix round 2 (2): a label/value gap of any width (the {0,8} bound let a padded gap escape)
+    "Account number" + " " * 9 + "123456",
+    "Account number" + " " * 12 + "123456",
+    "Account number" + " " * 40 + "123456",
+    "account no:" + " " * 30 + "SYNTH0001",
+    # realistic mask widths up to the 32-character bound (a longer x-mask is outside the pattern's bound)
+    "XXXXXXXX1234",
+    "xxxxxxxxxxxx 1234",
+    "X" * 32 + "1234",
+    "\u2022" + "x" * 16 + "-1234",  # a bullet is not a word character
 ]
+
+# every glued asterisk shape: a word-ish prefix directly against a 2+ asterisk mask and 3+ digits
+GLUED_PREFIXES = ["A/C", "a/c", "acct", "Acct", "account", "ending", "Loan", "loan", "card", "Card", "ref", "ID", "no", "num", "Max", "tax"]
+GLUED_MASKS = ["**", "***", "****", "********"]
+GLUED_SHAPES = [f"{prefix}{mask}{digits}" for prefix in GLUED_PREFIXES for mask in GLUED_MASKS for digits in ("123", "1234")]
 
 ACCOUNT_KEEP = [
     "An account last updated 2026-03-12",
@@ -200,6 +226,9 @@ ACCOUNT_KEEP = [
     "account normally serviced",  # 'no' is a word prefix, not the abbreviation
     "account nothing to add",
     "account notes attached",
+    "IDxxxx1234",  # a word glued to x's is not a mask
+    "Max1234",
+    "Maxx1234",
     "the account is in good standing",
     "an account last updated 2026-06-01",
     "emi 21,000 per month",
@@ -219,6 +248,19 @@ def test_account_id_keep_vectors_on_both_tiers(line: str) -> None:
     assert ACCOUNT_ID_RE.search(line) is None
     assert line_leaks(line, LLM_LEAK_PATTERNS) is False
     assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False
+
+
+@pytest.mark.parametrize("line", GLUED_SHAPES)
+def test_glued_asterisk_masks_leak_on_both_tiers(line: str) -> None:
+    assert ACCOUNT_ID_RE.search(line) is not None
+    assert line_leaks(line, LLM_LEAK_PATTERNS) is True
+    assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is True
+
+
+@pytest.mark.parametrize("line", ["*" * 70 + "1234", "x" + "*" * 70 + "1234", "ending" + "*" * 70 + "1234"])
+def test_a_very_long_asterisk_mask_still_leaks(line: str) -> None:
+    # the mask run is bounded in the pattern (linear scan); a later start inside the run catches an over-long one
+    assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is True
 
 
 # --------------------------------------------------------------------------- bureau names (fix round 1, ruled)
@@ -258,6 +300,20 @@ NORMALIZATION_DROP = [
     "account number \uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19",
     "a/c no: SYN\u200bTH0001",
     "1234\u200b56789",  # a 9-digit run split by a zero-width space
+    # fix round 2 (3): every Unicode Cf character and the default-ignorable non-Cf extras
+    "Score is 7\u206236",  # invisible times
+    "CI\u202cBIL",  # pop directional formatting
+    "Score is 7\u200e36",  # left-to-right mark
+    "Score is 7\u200f36",  # right-to-left mark
+    "Score is 7\u206636",  # left-to-right isolate
+    "Score is 7\u206936",  # pop directional isolate
+    "Score is 7\u20603\u20636",  # word joiner / invisible separator
+    "Score is 7\u034f36",  # combining grapheme joiner
+    "Score is 7\u115f36",  # hangul choseong filler
+    "Score is 7\u316436",  # hangul filler
+    "CI\ufe0fBIL",  # variation selector-16 inside a word
+    "Ex\u180bperian",  # mongolian free variation selector
+    "account number 12345\u200e6789",
 ]
 
 NORMALIZATION_KEEP = [
@@ -292,26 +348,43 @@ def test_kept_lines_are_returned_as_the_original_text() -> None:
     assert scrub_lines(lines) == ["Fine\u200b text", "\uff21 clean"]
 
 
+def test_every_unicode_format_character_is_invisible_to_the_scan() -> None:
+    # Exhaustive over the whole code space: any Cf character dropped inside a score, a bureau name or a long digit run
+    # must not hide it. (Cf = Unicode "format" category: zero-width, bidi controls, invisible operators, tags, ...)
+    format_chars = [chr(cp) for cp in range(sys.maxunicode + 1) if unicodedata.category(chr(cp)) == "Cf"]
+    assert len(format_chars) > 100  # the category really was enumerated
+    for ch in format_chars:
+        assert line_leaks(f"Score is 7{ch}36") is True, hex(ord(ch))
+        assert line_leaks(f"CI{ch}BIL") is True, hex(ord(ch))
+        assert line_leaks(f"1234{ch}56789") is True, hex(ord(ch))
+
+
 # --------------------------------------------------------------------------- bounded backtracking (fix round 1)
 
 
-@pytest.mark.parametrize(
-    "hostile",
-    [
-        "account number" + " " * 100_000,
-        "account number" + " " * 100_000 + "x",
-        "account no" + "-" * 100_000,
-        "*" * 200_000,
-        "x" * 200_000,
-        "*x" * 100_000,
-        "a/c " * 50_000,
-        "1" * 200_000,
-    ],
-)
-def test_the_account_pattern_does_not_backtrack_quadratically(hostile: str) -> None:
+HOSTILE_INPUTS: dict[str, str] = {
+    "padded-gap": "account number" + " " * 40_000,
+    "padded-gap-then-text": "account number" + " " * 40_000 + "x",
+    "dash-gap": "account no" + "-" * 40_000,
+    "colon-gap": "account no" + ": " * 20_000,
+    "asterisk-run": "*" * 50_000,
+    "x-run": "x" * 100_000,
+    "alternating-star-x": "*x" * 20_000,  # every '*' sits after a word character
+    "alternating-x-star": "x*" * 20_000,
+    "x-double-star": "x**" * 15_000,
+    "letter-double-star": "A**" * 15_000,
+    "repeated-label": "a/c " * 20_000,
+    "digit-run": "1" * 100_000,
+    "zero-width-run": "\u200b" * 50_000 + "7" + "\u200b" * 50_000,  # the normaliser itself is linear
+}
+
+
+@pytest.mark.parametrize("name", sorted(HOSTILE_INPUTS))
+def test_the_account_pattern_does_not_backtrack_quadratically(name: str) -> None:
     started = time.perf_counter()
-    line_leaks(hostile, LLM_LEAK_PATTERNS)
-    assert time.perf_counter() - started < 2.0
+    line_leaks(HOSTILE_INPUTS[name], LLM_LEAK_PATTERNS)
+    # linear scans finish in milliseconds; each quadratic shape this pins takes tens of seconds at these sizes
+    assert time.perf_counter() - started < 1.0
 
 
 # --------------------------------------------------------------------------- label-tier vectors (the two-tier reason)
@@ -488,6 +561,15 @@ def test_formatted_full_label_passes_the_global_tier_for_every_date() -> None:
     for d in DATE_SWEEP:
         formatted = LABEL_FULL_FMT.format(report_date=d.isoformat())
         assert line_leaks(formatted, GLOBAL_LEAK_PATTERNS) is False, d
+
+
+def test_the_stale_account_confirm_strings_pass_both_tiers_for_every_date() -> None:
+    # derive/emi.py's real prefix plus the dossier's capitalised mandated copy, over the same 40 years of dates
+    for d in DATE_SWEEP:
+        for template in (f"{_STALE_CONFIRM_PREFIX} {{d}}", "An account last updated {d}"):
+            line = template.format(d=d.isoformat())
+            assert line_leaks(line, LLM_LEAK_PATTERNS) is False, line
+            assert line_leaks(line, GLOBAL_LEAK_PATTERNS) is False, line
 
 
 def test_the_generic_bureau_word_is_exactly_why_the_two_labels_need_the_names_only_tier() -> None:
