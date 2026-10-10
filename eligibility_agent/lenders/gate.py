@@ -4,9 +4,10 @@ The gate decides which lenders the model may rank. It is pure: published rows (a
 pincodes by the repo) go in, ``(GatedLenders sorted by id, warning strings)`` come out. No I/O, no clock, no repo.
 
 * Criteria arrive as the ``lenders.criteria`` jsonb contract (Task 2's ``LenderRow.criteria``): every field is
-  ``{"value": <typed>, "status": "known" | "missing" | "uncertain"}``. The admin-UI key names ``min_score_floor``,
-  ``min_age`` and ``max_age_at_maturity`` are mapped onto ``LenderCriteria.score_floor`` / ``min_age_years`` /
-  ``max_age_at_maturity_years`` (the canonical names are accepted too); the per-field status becomes
+  ``{"value": <typed>, "status": "known" | "missing" | "uncertain"}``. db/schema.sql's key spellings ``min_score_floor``,
+  ``min_age`` and ``max_age_at_maturity`` are THE canonical wire contract and are mapped onto ``LenderCriteria.score_floor``
+  / ``min_age_years`` / ``max_age_at_maturity_years``; the ``LenderCriteria`` names are a fallback spelling only, and a row
+  carrying both spellings with differing content is invalid (excluded). The per-field status becomes
   ``LenderCriteria.field_status`` for all twelve criteria fields (an absent key is ``'missing'``).
 * ``REQUIRED_FOR_MATCHING`` plus the floor rule (``score_floor`` OR ``ntc_accepted`` known) decide matchability. A lender
   that fails is EXCLUDED with a warning string (``lender <id> excluded: missing <fields>``) and never aborts the check.
@@ -80,8 +81,10 @@ _CRITERIA_FIELDS: Final[tuple[str, ...]] = (
     "loan_max",
 )
 
-# schema.sql / admin-UI jsonb key -> LenderCriteria field (the canonical names are accepted too, and win when both exist).
-_JSONB_KEY_ALIASES: Final[dict[str, str]] = {
+# LenderCriteria field -> its db/schema.sql wire spelling. The schema spelling is THE canonical jsonb contract and wins;
+# the LenderCriteria field name is accepted as a fallback spelling only. A row carrying BOTH spellings of one field must
+# agree exactly (same status, same value) or it is invalid (fail closed). The other nine keys have a single spelling.
+_SCHEMA_KEYS: Final[dict[str, str]] = {
     "score_floor": "min_score_floor",
     "min_age_years": "min_age",
     "max_age_at_maturity_years": "max_age_at_maturity",
@@ -121,33 +124,44 @@ def uncertain_required_fields(c: LenderCriteria) -> list[str]:
     return [f for f in (*REQUIRED_FOR_MATCHING, *FLOOR_FIELDS) if _status_of(c, f) == "uncertain"]
 
 
+def _read_entry(entry: object) -> tuple[FieldStatus, Any] | None:
+    """``(status, effective value)`` of one ``{value, status}`` entry, or None when it is not a usable entry.
+
+    Status ``'missing'`` forces the effective value to None so nothing downstream can use it.
+    """
+    entry_dict = cast("dict[str, Any]", entry) if isinstance(entry, dict) else {}
+    status: Any = entry_dict.get("status")
+    if not isinstance(status, str) or status not in _VALID_STATUSES:
+        return None
+    return cast(FieldStatus, status), (None if status == "missing" else entry_dict.get("value"))
+
+
 def _parse_criteria(raw: object, policy_notes: str | None) -> tuple[LenderCriteria | None, list[str]]:
     """Normalise the jsonb contract into a ``LenderCriteria``; ``(None, invalid_field_names)`` when it cannot be.
 
-    A missing key is ``'missing'`` (value None); status ``'missing'`` forces the value to None so nothing downstream can
-    use it. A bare (non ``{value, status}``) entry, an unknown status, a value of the wrong type, or a non-finite
-    number makes the field invalid.
+    A missing key is ``'missing'`` (value None). The three fields with two spellings read the schema.sql spelling first
+    (``min_score_floor`` / ``min_age`` / ``max_age_at_maturity``) and fall back to the ``LenderCriteria`` name; when both
+    are present they must carry the identical ``(status, value)`` or the field is invalid. A bare (non ``{value,
+    status}``) entry, an unknown status, a value of the wrong type, or a non-finite number also makes the field invalid.
     """
     source: dict[str, Any] = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
     data: dict[str, Any] = {"policy_notes": policy_notes or None}
     statuses: dict[str, FieldStatus] = {}
     invalid: list[str] = []
     for name in _CRITERIA_FIELDS:
-        key = name if name in source else _JSONB_KEY_ALIASES.get(name, name)
-        if key not in source:
+        spellings = [k for k in (_SCHEMA_KEYS.get(name), name) if k is not None and k in source]  # schema spelling first
+        if not spellings:
             data[name] = None
             statuses[name] = "missing"
             continue
-        entry: Any = source[key]
-        entry_dict = cast("dict[str, Any]", entry) if isinstance(entry, dict) else {}
-        status: Any = entry_dict.get("status")
-        if not isinstance(status, str) or status not in _VALID_STATUSES:
+        entries = [_read_entry(source[k]) for k in spellings]
+        first = entries[0]
+        if first is None or any(e != first for e in entries[1:]):
             invalid.append(name)
             data[name] = None
             statuses[name] = "missing"
             continue
-        statuses[name] = cast(FieldStatus, status)
-        data[name] = None if status == "missing" else entry_dict.get("value")
+        statuses[name], data[name] = first
     data["field_status"] = statuses
     if invalid:
         return None, invalid

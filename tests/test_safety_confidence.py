@@ -35,6 +35,7 @@ from eligibility_agent.graph.state import (
     Headline,
     Identity,
     Kind,
+    LcStatus,
     LenderCriteria,
     LenderNumbers,
     ModelOutput,
@@ -503,15 +504,32 @@ def test_run_safety_a_repeat_of_an_already_demoted_lender_is_not_relabelled_dupl
     assert r.top is not None and r.top.lender_id == "L2"
 
 
-def test_run_safety_alternates_are_capped_at_two_survivors() -> None:
+def test_run_safety_without_a_recommendation_promotes_the_first_surviving_alternate() -> None:
     gated, numbers = world("L1", "L2", "L3")
     r = run_safety(mo(None, ("L1", "L2")), gated, numbers, band="780+", age_app_years=30, age_known=True)
     # no recommendation: the first surviving alternate is promoted to top, the next becomes the alternate
     assert r.top is not None and r.top.lender_id == "L1"
     assert [a.lender_id for a in r.alternates] == ["L2"]
     assert r.review is False  # nothing was demoted
-    r3 = run_safety(mo("L1", ("L2", "L3")), gated, numbers, band="780+", age_app_years=30, age_known=True)
-    assert len(r3.alternates) <= 2
+
+
+def test_run_safety_caps_the_survivors_at_one_top_plus_two_alternates() -> None:
+    """ModelOutput validates ``alternates`` to at most 2 (so a validated output has at most 3 candidates); the cap in
+    run_safety is a defensive second line, exercised here with an unvalidated over-long output."""
+    gated, numbers = world("L1", "L2", "L3", "L4")
+    over_long = ModelOutput.model_construct(
+        recommendation=pick("L1", 1),
+        alternates=[pick("L2", 2), pick("L3", 3), pick("L4", 4)],
+        confidence="high",
+        co_applicant_suggested=False,
+        co_applicant_reason=None,
+        review_flags=[],
+    )
+    r = run_safety(over_long, gated, numbers, band="780+", age_app_years=30, age_known=True)
+    assert r.top is not None and r.top.lender_id == "L1"
+    assert [a.lender_id for a in r.alternates] == ["L2", "L3"]  # L4 is the third survivor past the cap: dropped
+    assert r.demoted == []  # dropped by the cap, not demoted
+    assert r.review is False
 
 
 def test_run_safety_uses_the_dob_flags() -> None:
@@ -873,7 +891,7 @@ _DEFAULT_SAFETY = safety_result()  # a surviving top 'L1' that clears its floor;
 
 def headline(
     *,
-    status: str = "ok",
+    status: LcStatus = "ok",
     band: Band | None = "720-780",
     final_conf: Confidence | None = "high",
     safety: SafetyResult | None = _DEFAULT_SAFETY,
@@ -903,17 +921,58 @@ def breach(rule: Rule, detail: str = "x", lender_id: str = "L1") -> SafetyBreach
 NO_HEADROOM = breach("min_loan_amount", NO_HEADROOM_DETAIL)
 
 
-# ---- (a) status != 'ok' -> None
+# ---- (a) status != 'ok' -> None, with ONE exemption: service_failure + OPENAI_FAILURE (K7) -> band-derived (row e)
+
+NON_OK_STATUSES: tuple[LcStatus, ...] = ("refused", "pan_not_verified", "pending_verification", "service_failure")
+ALL_CODES: tuple[Code | None, ...] = ("NO_PINCODE_ON_PAN", "OPENAI_FAILURE", "SUREPASS_FAILURE", "CONSENT_MISSING", None)
+K7_PAIR: tuple[LcStatus, Code] = ("service_failure", "OPENAI_FAILURE")
 
 
-@pytest.mark.parametrize("status", ["refused", "pan_not_verified", "pending_verification", "service_failure"])
-def test_headline_a_non_ok_status_is_none(status: str) -> None:
+@pytest.mark.parametrize("status", NON_OK_STATUSES)
+def test_headline_a_non_ok_status_is_none(status: LcStatus) -> None:
     assert headline(status=status) is None
 
 
-@pytest.mark.parametrize("code", ["NO_PINCODE_ON_PAN", "OPENAI_FAILURE", "SUREPASS_FAILURE", None])
-def test_headline_a_non_ok_status_wins_over_every_code(code: Code | None) -> None:
-    assert headline(status="service_failure", code=code, band="780+", final_conf="high") is None
+@pytest.mark.parametrize(
+    ("status", "code"), [(s, c) for s in NON_OK_STATUSES for c in ALL_CODES if (s, c) != K7_PAIR]
+)
+def test_headline_a_non_ok_status_wins_over_every_code_except_the_k7_pair(status: LcStatus, code: Code | None) -> None:
+    assert headline(status=status, code=code, band="780+", final_conf="high") is None
+
+
+def test_headline_a_service_failure_with_surepass_failure_is_none() -> None:
+    """The exemption is for OPENAI_FAILURE only: a SurePass service failure has no usable band and shows no headline."""
+    assert headline(status="service_failure", code="SUREPASS_FAILURE", band="780+", final_conf="high") is None
+    assert headline(status="service_failure", code="SUREPASS_FAILURE", band="NTC", final_conf=None, safety=None) is None
+
+
+@pytest.mark.parametrize(
+    ("band", "expected"),
+    [("NTC", "unlikely"), ("<650", "unlikely"), ("650-720", "possible"), ("720-780", "possible"), ("780+", "possible")],
+)
+def test_headline_a_k7_service_failure_with_openai_failure_is_band_derived(band: Band, expected: Headline) -> None:
+    """K7's real wire status for an OPENAI_FAILURE run is 'service_failure'; it must reach the band-derived row."""
+    got = headline(status="service_failure", code="OPENAI_FAILURE", band=band, final_conf="low", safety=None)
+    assert got == expected
+
+
+def test_headline_a_k7_pair_is_identical_to_the_status_ok_openai_failure_result() -> None:
+    for band in ("NTC", "<650", "650-720", "720-780", "780+"):
+        wire = headline(status="service_failure", code="OPENAI_FAILURE", band=band, final_conf="low", safety=None)
+        ok = headline(status="ok", code="OPENAI_FAILURE", band=band, final_conf="low", safety=None)
+        assert wire == ok is not None
+
+
+def test_headline_a_k7_pair_still_precedes_the_generic_low_rows() -> None:
+    sr = safety_result(top=None, none_survived=True, demoted=[breach("band_floor")])
+    assert headline(status="service_failure", code="OPENAI_FAILURE", band="720-780", final_conf="low", safety=sr) == "possible"
+    assert headline(status="service_failure", code="OPENAI_FAILURE", band="720-780", final_conf="low", safety=None, gated=[]) == "possible"
+    assert headline(status="service_failure", code="OPENAI_FAILURE", band=None, final_conf="low", safety=None) == "under_review"  # defensive: no band
+
+
+@pytest.mark.parametrize("status", ["refused", "pan_not_verified", "pending_verification"])
+def test_headline_a_the_exemption_is_exactly_one_pair_other_statuses_with_openai_failure_stay_none(status: LcStatus) -> None:
+    assert headline(status=status, code="OPENAI_FAILURE", band="780+", final_conf="low", safety=None) is None
 
 
 # ---- (b) NO_PINCODE_ON_PAN: band-read
@@ -1016,6 +1075,45 @@ def test_headline_d_low_with_a_survivor_and_a_gated_list_is_under_review() -> No
     assert headline(final_conf="low", safety=safety_result(top="L1"), gated=[gl("L1")]) == "under_review"
 
 
+# ---- F3: the demotion-driven rows (c's demotion clause, d) need that NOTHING survived
+
+def test_headline_f3_a_surviving_top_with_a_band_floor_demoted_alternate_is_not_not_fundable_alone() -> None:
+    sr = safety_result(top="L1", clears=True, demoted=[breach("band_floor", lender_id="L2")])
+    got = headline(band="720-780", final_conf="low", safety=sr, gated=[gl("L1"), gl("L2")])
+    assert got != "not_fundable_alone"  # an applicant WITH a surviving lender is not 'not fundable alone'
+    assert got == "under_review"  # falls through to row i: no g/h row exists for final 'low'
+
+
+def test_headline_f3_a_surviving_top_with_a_no_headroom_demoted_alternate_is_not_not_fundable_alone() -> None:
+    sr = safety_result(top="L1", clears=True, demoted=[breach("min_loan_amount", NO_HEADROOM_DETAIL, "L2")])
+    got = headline(band="780+", final_conf="low", safety=sr, gated=[gl("L1"), gl("L2")])
+    assert got != "not_fundable_alone"
+
+
+def test_headline_f3_the_same_demotions_with_no_survivor_still_fire_not_fundable_alone() -> None:
+    sr = safety_result(top=None, none_survived=True, clears=None, demoted=[breach("band_floor", lender_id="L2")])
+    assert headline(band="720-780", final_conf="low", safety=sr, gated=[gl("L2")]) == "not_fundable_alone"
+
+
+def test_headline_f3_ntc_with_a_surviving_top_and_a_demoted_alternate_falls_to_the_ntc_row_not_row_d() -> None:
+    # before F3 row d fired here ('under_review'); with a survivor the NTC-survivor row f decides
+    sr = safety_result(top="L1", clears=None, demoted=[breach("foir_limit", lender_id="L2")])
+    assert headline(band="NTC", final_conf="low", safety=sr, gated=[gl("L1"), gl("L2")]) == "unlikely"
+
+
+@pytest.mark.parametrize(("conf", "expected"), [("high", "fundable"), ("medium", "possible")])
+def test_headline_f3_a_surviving_top_with_demoted_alternates_follows_the_confidence_rows(
+    conf: Confidence, expected: Headline
+) -> None:
+    sr = safety_result(top="L1", clears=True, demoted=[breach("band_floor", lender_id="L2"), breach("foir_limit", lender_id="L3")])
+    assert headline(band="720-780", final_conf=conf, safety=sr, gated=[gl("L1"), gl("L2"), gl("L3")]) == expected
+
+
+def test_headline_f3_gated_empty_is_not_demotion_driven_and_needs_no_survivor_flag() -> None:
+    # row c's "gate empty" clause is independent of the survivor test
+    assert headline(final_conf="low", gated=[], safety=None) == "not_fundable_alone"
+
+
 # ---- (f) NTC survivor -> unlikely
 
 
@@ -1102,6 +1200,19 @@ def test_headline_row_order_is_exhaustive_over_the_status_ok_cross_product() -> 
                             status="ok", band=band, final_conf=conf, safety=sr, gated=gated, code=code, model_output=None
                         )
                         assert got in valid
+
+
+def test_headline_status_cross_product_is_none_exactly_off_the_ok_path_and_never_none_on_it() -> None:
+    statuses: tuple[LcStatus, ...] = ("ok", *NON_OK_STATUSES)
+    codes: tuple[Code | None, ...] = (None, "NO_PINCODE_ON_PAN", "OPENAI_FAILURE", "SUREPASS_FAILURE")
+    for status in statuses:
+        for code in codes:
+            for band in ("NTC", "<650", "780+"):
+                got = compute_headline(
+                    status=status, band=band, final_conf="low", safety=None, gated=[gl("L1")], code=code, model_output=None
+                )
+                on_ok_path = status == "ok" or (status, code) == K7_PAIR
+                assert (got is not None) is on_ok_path, (status, code, band, got)
 
 
 # --------------------------------------------------------------------------- module-level: purity + registry

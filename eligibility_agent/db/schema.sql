@@ -10,11 +10,18 @@ create table if not exists lenders (
   published    boolean not null default false,
   criteria     jsonb not null default '{}'::jsonb,
   -- criteria contract: every field is {"value": <typed>, "status": "known"|"missing"|"uncertain"}.
-  -- REQUIRED keys (lender excluded from matching unless ALL have status='known' -- PRD 11):
+  -- CANONICAL key spellings (lenders/gate.py reads these first; the LenderCriteria names score_floor, min_age_years,
+  -- max_age_at_maturity_years are accepted as a fallback spelling only, and a row carrying both with differing
+  -- content is excluded as invalid):
   --   min_score_floor (int, entered as an Experian score; open item), ntc_accepted (bool),
   --   foir_limit (number 0..1), min_income (int), min_age (int), max_age_at_maturity (int),
   --   rate_min_pct (number), rate_max_pct (number), tenure_min_months (int), tenure_max_months (int),
   --   loan_min (int), loan_max (int).
+  -- Matching REQUIRES (status != 'missing' and a value): foir_limit, rate_min_pct, rate_max_pct, tenure_min_months,
+  --   tenure_max_months, loan_min, loan_max (the 7 REQUIRED_FOR_MATCHING fields), PLUS the floor pair: min_score_floor
+  --   known OR ntc_accepted known. A lender missing any of these is excluded from matching until fixed (PRD 11).
+  -- Every other field (min_income, min_age, max_age_at_maturity) may be absent: the checks that use it are skipped.
+  --   An 'uncertain' status on a required field keeps the lender in (value usable) but caps confidence at medium.
   -- OPTIONAL: min_income_by_employment (object), state_list (text[]).
   policy_notes text not null default '',
   created_by   text,

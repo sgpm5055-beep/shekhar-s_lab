@@ -33,6 +33,7 @@ from eligibility_agent.graph.state import (
     Headline,
     Identity,
     Kind,
+    LcStatus,
     LenderCriteria,
     LenderNumbers,
     ModelOutput,
@@ -315,7 +316,7 @@ def _every_demotion_is_floor_or_headroom(safety: SafetyResult | None) -> bool:
 
 def compute_headline(
     *,
-    status: str,
+    status: LcStatus,
     band: Band | None,
     final_conf: Confidence | None,
     safety: SafetyResult | None,
@@ -325,30 +326,39 @@ def compute_headline(
 ) -> Headline | None:
     """The headline, in code (K13 merged table; first match wins; the model never influences it).
 
+    ``status`` is the true LcView wire status: an OPENAI_FAILURE run is ``status='service_failure'`` (K7), and callers pass
+    it as-is (never a synthetic ``'ok'``).
+
     | #   | condition                                                                        | headline             |
-    | a   | ``status != 'ok'``                                                               | None                 |
+    | a   | ``status != 'ok'``, EXCEPT ``status == 'service_failure'`` with ``code ==         | None                 |
+    |     | 'OPENAI_FAILURE'`` (the single exemption, which falls through to row e)           |                      |
     | b   | ``code == 'NO_PINCODE_ON_PAN'`` (band read): band NTC / '<650'; any other band    | unlikely; possible   |
     | e   | ``code == 'OPENAI_FAILURE'``: the same band-derived mapping (K7, never review)    | unlikely; possible   |
-    | c   | final low AND (gate empty OR every demotion was band_floor / no-headroom)         | not_fundable_alone   |
-    | d   | final low otherwise (mixed demotions, nothing returned, no safety result)         | under_review         |
+    | c   | final low AND (gate empty, OR nothing survived AND every demotion was band_floor  | not_fundable_alone   |
+    |     | / no-headroom)                                                                    |                      |
+    | d   | final low, nothing survived, any other demotion mix / nothing returned / no       | under_review         |
+    |     | safety result                                                                     |                      |
     | f   | band NTC and a pick survived (an NTC-accepting lender)                            | unlikely             |
     | g   | final high and a top survived                                                    | fundable             |
     | h   | final medium and a top survived                                                  | possible             |
-    | i   | anything else (defensive)                                                        | under_review         |
+    | i   | anything else, incl. final low with a surviving top at a scored band (defensive)  | under_review         |
 
     Rows b and e map identically and come BEFORE the generic low rows (an OPENAI_FAILURE run is final-low but must show
-    the band-derived headline). Forcing the co-applicant flag on ``not_fundable_alone`` / NTC ``unlikely`` is the view
-    builder's job. ``model_output`` is accepted for signature parity with the dossier; no row reads it.
+    the band-derived headline). The demotion-driven rows (c's demotion clause, d) need ``safety.top is None``: a surviving
+    top whose alternates were demoted falls through to rows f..i. Forcing the co-applicant flag on ``not_fundable_alone`` /
+    NTC ``unlikely`` is the view builder's job. ``model_output`` is accepted for signature parity with the dossier; no
+    row reads it.
     """
-    if status != "ok":
+    if status != "ok" and not (status == "service_failure" and code == "OPENAI_FAILURE"):
         return None
     if code == "NO_PINCODE_ON_PAN" or code == "OPENAI_FAILURE":
         return _band_derived_headline(band)
-    if final_conf == "low":
-        if not gated or _every_demotion_is_floor_or_headroom(safety):
-            return "not_fundable_alone"
-        return "under_review"
     survivor = safety is not None and safety.top is not None
+    if final_conf == "low":
+        if not gated:
+            return "not_fundable_alone"
+        if not survivor:
+            return "not_fundable_alone" if _every_demotion_is_floor_or_headroom(safety) else "under_review"
     if band == "NTC" and survivor:
         return "unlikely"
     if survivor and final_conf == "high":

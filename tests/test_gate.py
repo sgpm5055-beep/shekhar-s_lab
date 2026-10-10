@@ -202,13 +202,127 @@ def test_gate_keeps_a_complete_row_and_builds_the_gated_lender() -> None:
     assert g.tenure_label == "12 to 48 months"
 
 
-def test_gate_accepts_the_canonical_lender_criteria_key_names_too() -> None:
-    crit_json = criteria_jsonb(drop=("min_score_floor", "min_age", "max_age_at_maturity"))
-    crit_json.update({"score_floor": jb(700), "min_age_years": jb(23), "max_age_at_maturity_years": jb(60)})
+# --- the three two-spelling fields: db/schema.sql spelling is canonical, the LenderCriteria name is a fallback only
+
+SCHEMA_TO_CANONICAL = {
+    "min_score_floor": "score_floor",
+    "min_age": "min_age_years",
+    "max_age_at_maturity": "max_age_at_maturity_years",
+}
+DISTINCT = {"min_score_floor": 700, "min_age": 23, "max_age_at_maturity": 60}  # differ from the seed (650 / 21 / 58)
+
+
+def test_gate_schema_spelling_only_row_matches() -> None:
+    crit_json = criteria_jsonb()
+    crit_json.update({k: jb(v) for k, v in DISTINCT.items()})
+    assert not set(SCHEMA_TO_CANONICAL.values()) & set(crit_json)  # no fallback key anywhere in this row
     gated, warnings = gate_lenders([row("L1", criteria=crit_json)], ["560001"])
     assert warnings == []
-    assert (gated[0].criteria.score_floor, gated[0].criteria.min_age_years) == (700, 23)
-    assert gated[0].criteria.max_age_at_maturity_years == 60
+    c = gated[0].criteria
+    assert (c.score_floor, c.min_age_years, c.max_age_at_maturity_years) == (700, 23, 60)
+    assert [c.field_status[f] for f in SCHEMA_TO_CANONICAL.values()] == ["known", "known", "known"]
+
+
+def test_gate_fallback_spelling_only_row_matches() -> None:
+    crit_json = criteria_jsonb(drop=tuple(SCHEMA_TO_CANONICAL))
+    crit_json.update({SCHEMA_TO_CANONICAL[k]: jb(v) for k, v in DISTINCT.items()})
+    assert not set(SCHEMA_TO_CANONICAL) & set(crit_json)  # no schema key anywhere in this row
+    gated, warnings = gate_lenders([row("L1", criteria=crit_json)], ["560001"])
+    assert warnings == []
+    c = gated[0].criteria
+    assert (c.score_floor, c.min_age_years, c.max_age_at_maturity_years) == (700, 23, 60)
+
+
+def test_gate_both_spellings_present_and_equal_matches() -> None:
+    crit_json = criteria_jsonb()
+    crit_json.update({k: jb(v) for k, v in DISTINCT.items()})
+    crit_json.update({SCHEMA_TO_CANONICAL[k]: jb(v) for k, v in DISTINCT.items()})
+    gated, warnings = gate_lenders([row("L1", criteria=crit_json)], ["560001"])
+    assert warnings == []
+    c = gated[0].criteria
+    assert (c.score_floor, c.min_age_years, c.max_age_at_maturity_years) == (700, 23, 60)
+
+
+def test_gate_both_spellings_equal_across_int_and_float_is_still_equal() -> None:
+    crit_json = criteria_jsonb(min_score_floor=jb(700))
+    crit_json["score_floor"] = jb(700.0)
+    gated, warnings = gate_lenders([row("L1", criteria=crit_json)], ["560001"])
+    assert warnings == []
+    assert gated[0].criteria.score_floor == 700
+
+
+@pytest.mark.parametrize("schema_key", list(SCHEMA_TO_CANONICAL))
+def test_gate_both_spellings_conflicting_is_invalid_criteria_and_excluded(schema_key: str) -> None:
+    canonical = SCHEMA_TO_CANONICAL[schema_key]
+    crit_json = criteria_jsonb()
+    crit_json[schema_key] = jb(DISTINCT[schema_key])
+    crit_json[canonical] = jb(DISTINCT[schema_key] + 1)  # same field, different value under the other spelling
+    gated, warnings = gate_lenders([row("L7", criteria=crit_json), row("L1")], ["560001"])
+    assert [g.id for g in gated] == ["L1"]  # fail closed: the conflicting row is out, the clean one still gates
+    assert warnings == [f"lender L7 excluded: invalid criteria {canonical}"]
+
+
+def test_gate_conflict_is_invalid_whichever_spelling_carries_which_value() -> None:
+    # neither spelling may silently win: swapping which one holds the 'bigger' value gives the same exclusion
+    for schema_value, fallback_value in ((650, 700), (700, 650)):
+        crit_json = criteria_jsonb(min_score_floor=jb(schema_value))
+        crit_json["score_floor"] = jb(fallback_value)
+        gated, warnings = gate_lenders([row("L7", criteria=crit_json)], ["560001"])
+        assert gated == []
+        assert warnings == ["lender L7 excluded: invalid criteria score_floor"]
+
+
+def test_gate_both_spellings_with_the_same_value_but_different_status_is_a_conflict() -> None:
+    crit_json = criteria_jsonb(min_age=jb(23, "known"))
+    crit_json["min_age_years"] = jb(23, "uncertain")
+    gated, warnings = gate_lenders([row("L7", criteria=crit_json)], ["560001"])
+    assert gated == []
+    assert warnings == ["lender L7 excluded: invalid criteria min_age_years"]
+
+
+def test_gate_schema_missing_against_a_known_fallback_is_a_conflict_not_a_silent_win() -> None:
+    crit_json = criteria_jsonb(min_score_floor=jb(None, "missing"))
+    crit_json["score_floor"] = jb(700)
+    gated, warnings = gate_lenders([row("L7", criteria=crit_json)], ["560001"])
+    assert gated == []
+    assert warnings == ["lender L7 excluded: invalid criteria score_floor"]
+
+
+def test_gate_both_spellings_agreeing_on_missing_is_fine_and_still_missing() -> None:
+    crit_json = criteria_jsonb(min_score_floor=jb(None, "missing"), ntc_accepted=jb(True))
+    crit_json["score_floor"] = jb(None, "missing")
+    gated, warnings = gate_lenders([row("L1", criteria=crit_json)], ["560001"])
+    assert warnings == []
+    assert gated[0].criteria.score_floor is None
+    assert gated[0].criteria.field_status["score_floor"] == "missing"
+
+
+def test_gate_both_spellings_agreeing_on_uncertain_carries_the_uncertain_status() -> None:
+    crit_json = criteria_jsonb(min_score_floor=jb(700, "uncertain"))
+    crit_json["score_floor"] = jb(700, "uncertain")
+    gated, warnings = gate_lenders([row("L1", criteria=crit_json)], ["560001"])
+    assert warnings == []
+    assert gated[0].criteria.field_status["score_floor"] == "uncertain"
+    assert uncertain_required_fields(gated[0].criteria) == ["score_floor"]
+
+
+@pytest.mark.parametrize("malformed_side", ["schema", "fallback"])
+def test_gate_one_malformed_spelling_poisons_the_field_even_when_the_other_is_clean(malformed_side: str) -> None:
+    crit_json = criteria_jsonb(min_score_floor=jb(700))
+    crit_json["score_floor"] = jb(700)
+    crit_json["min_score_floor" if malformed_side == "schema" else "score_floor"] = 700  # bare, not {value, status}
+    gated, warnings = gate_lenders([row("L7", criteria=crit_json)], ["560001"])
+    assert gated == []
+    assert warnings == ["lender L7 excluded: invalid criteria score_floor"]
+
+
+def test_gate_single_spelling_fields_have_no_alias_surface() -> None:
+    # foir_limit has exactly one spelling; an unrelated alias-looking key is ignored, never read
+    crit_json = criteria_jsonb(drop=("foir_limit",))
+    crit_json["foir"] = jb(0.5)
+    gated, warnings = gate_lenders([row("L7", criteria=crit_json)], ["560001"])
+    assert gated == []
+    assert warnings == ["lender L7 excluded: missing foir_limit"]
 
 
 def test_gate_excludes_a_lender_missing_a_required_field_with_the_pinned_warning_string() -> None:
