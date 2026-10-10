@@ -16,7 +16,7 @@ check row is inserted at step 1.5, right after the consent row and BEFORE any lo
   1.5. repo.insert_check(CheckRow(status='running', billed=False, counted_against_quota=False, ...)) -- EVERY
        outcome incl. refusals, BEFORE the lock checks and BEFORE any SurePass call (C1 insert-early; terminal
        update is guarded on status='running').
-  2.   locks = repo.get_active_locks(pan_hash):
+  2.   locks = repo.get_active_locks(pan_hash):   (node-level gate: runs BEFORE the tables, see LOCK GATE below)
          any kind='timeout'   active -> refuse PAN_LOCKED
          any kind='daily_cap' active -> refuse PAN_DAILY_CAP
   3.   acquired = repo.try_acquire_pan_lock(pan_hash, check_id, until=now + IN_FLIGHT_LOCK_TTL)
@@ -30,10 +30,16 @@ check row is inserted at step 1.5, right after the consent row and BEFORE any lo
        ``record_pan_correction`` itself; the pure tables never do).
   8.   refusal -> persist_refusal -> END. persist / persist_refusal ALWAYS release the in-flight lock (finally).
 
-K2 RECONCILIATION GATE. While it lasts, the 10-minute timeout lock is enforced by the NODE at step 2 (via
-get_active_locks). The pure tables (QK7 / FL6) gate on ``AdmissionFacts.reconciliation_pending`` -- an unresolved
-'timeout_reconciliation' review row -- independently of any lock row or of the clock. Lock expiry alone never
-re-admits: once TIMEOUT_LOCK_TTL has elapsed the tables keep refusing PAN_LOCKED until the review row is resolved.
+LOCK GATE vs PURE TABLES. The step-2 refusals (active timeout / daily_cap lock) run in the NODE, BEFORE the pure
+tables, and therefore preempt EVERYTHING the tables would decide, table cache hits (QK1 / QK3 / FL1 / FL4)
+included: the tables never see a locked state. That is the node's lock gate, not a table row.
+
+K2 RECONCILIATION GATE (billed pulls only). Once the 10-minute timeout lock has expired, the node's step-2 gate no
+longer fires; the tables' own gate is ``AdmissionFacts.reconciliation_pending`` -- an unresolved
+'timeout_reconciliation' review row -- which refuses PAN_LOCKED on the PULL paths only (QK7 / FL6), independently
+of any lock row or of the clock. Lock expiry alone never re-admits a billed pull: after TIMEOUT_LOCK_TTL has
+elapsed, QK7 / FL6 keep refusing until the review row is resolved. It does NOT gate cache hits: with the lock
+expired, QK1 / QK3 / FL1 / FL4 are served under ``reconciliation_pending`` (a cache hit makes no billed call).
 
 Mid-run codes (never produced by admission): NO_PINCODE_ON_PAN (pincode gate), SUREPASS_FAILURE (bureau / PAN
 node) and OPENAI_FAILURE (rank node, after its single retry). Per-call timeouts live in config.py.
