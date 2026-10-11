@@ -194,6 +194,8 @@ def test_consent_round_trip_shape() -> None:
     assert stored["covers"] == "score"
     with pytest.raises(ValueError):
         repo.insert_consent(make_consent())
+    assert repo.get_consent(make_consent().id) == make_consent()  # timestamps decoded back to aware datetimes
+    assert repo.get_consent("con-9") is None
 
 
 def test_cache_rows_round_trip_and_upsert() -> None:

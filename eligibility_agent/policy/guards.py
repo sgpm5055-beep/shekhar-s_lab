@@ -533,19 +533,29 @@ def admit_recompute(
 AttachOutcome = Literal["ok", "not_found", "not_quick", "already_attached", "conflict"]
 
 
-def admit_attach(kind: Kind | None, existing_contact_id: str | None, contact_id: str) -> AttachOutcome:
-    """POST /checks/{check_id}/attach. ``kind`` None means the check does not exist.
+def admit_attach(
+    kind: Kind | None, existing_contact_id: str | None, contact_id: str, *, consent_contact_id: str | None
+) -> AttachOutcome:
+    """POST /checks/{check_id}/attach. ``kind`` None means the check does not exist. ``consent_contact_id`` is the
+    contact already on the check's CONSENT row (None when unset or when the check has no consent row).
 
-    | A1 | check missing                      -> 'not_found' (404) |
-    | A2 | check.kind != 'quick'              -> 'not_quick' (409) |
-    | A3 | check.contact_id == contact_id     -> 'already_attached' (idempotent 200) |
-    | A4 | check.contact_id set and different -> 'conflict' (409) |
-    | A5 | else 'ok': repo.attach_contact updates checks.contact_id AND consents.contact_id (PRD 11). |
+    | A1  | check missing                                   -> 'not_found' (404) |
+    | A2  | check.kind != 'quick'                           -> 'not_quick' (409) |
+    | A2b | the consent row carries a DIFFERENT contact     -> 'conflict' (409) |
+    | A3  | check.contact_id == contact_id                  -> 'already_attached' (idempotent 200) |
+    | A4  | check.contact_id set and different              -> 'conflict' (409) |
+    | A5  | else 'ok': repo.attach_contact updates checks.contact_id AND consents.contact_id (PRD 11). |
+
+    A2b (T14 fix round 1): a recompute row SHARES its original's consent row (K9), so attaching one of them sets the
+    contact on a consent the other also points at; attaching the other to a different contact would silently rewrite
+    the compliance record. The consent's contact therefore conflicts like the check's own (same contact: idempotent).
     """
     if kind is None:
         return "not_found"
     if kind != "quick":
         return "not_quick"
+    if consent_contact_id is not None and consent_contact_id != contact_id:
+        return "conflict"
     if existing_contact_id == contact_id:
         return "already_attached"
     if existing_contact_id is not None:

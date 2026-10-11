@@ -396,6 +396,37 @@ def test_attach_matrix_on_a_quick_check(make_api: ApiFactory) -> None:
     assert api.row(other["check_id"]).contact_id is None
 
 
+def test_a_recompute_and_its_original_share_one_consent_so_they_share_one_contact(make_api: ApiFactory) -> None:
+    """K9: the recompute row carries the ORIGINAL's consent_id. Attaching the recompute sets the contact on that shared
+    consent row, so attaching the original to a DIFFERENT contact is a conflict (it would rewrite the compliance record);
+    the same contact is still accepted (fix round 1, policy A2b)."""
+    api = make_api(lambda sink: happy_quick_scenario(sink=sink))
+    original = api.quick()
+    response = _recompute(api, original["check_id"], {"monthly_income": 60000})
+    assert response.status_code == 200, response.text
+    recompute_id: str = response.json()["check_id"]
+    consent_id = api.row(original["check_id"]).consent_id
+    assert api.row(recompute_id).consent_id == consent_id
+
+    attached = _attach(api, recompute_id, "c_1")
+    assert attached.status_code == 200, attached.text
+    assert api.consent(original["check_id"]).contact_id == "c_1"  # the SHARED consent row
+
+    conflict = _attach(api, original["check_id"], "c_2")
+
+    assert (conflict.status_code, conflict.json()) == (409, {"detail": "already_attached"})
+    assert api.consent(original["check_id"]).contact_id == "c_1"  # the compliance record is not rewritten
+    assert (api.row(original["check_id"]).contact_id, api.row(recompute_id).contact_id) == (None, "c_1")
+
+    same = _attach(api, original["check_id"], "c_1")
+
+    assert (same.status_code, same.json()) == (
+        200,
+        {"check_id": original["check_id"], "contact_id": "c_1", "attached": True},
+    )
+    assert (api.row(original["check_id"]).contact_id, api.consent(original["check_id"]).contact_id) == ("c_1", "c_1")
+
+
 def test_attach_is_quick_only_and_404_for_an_unknown_check(make_api: ApiFactory) -> None:
     api = make_api(lambda sink: full_happy_reported_emi_scenario(sink=sink))
     full = api.full()

@@ -1196,7 +1196,26 @@ def test_recompute_does_not_require_freshness_inputs() -> None:
     ],
 )
 def test_admit_attach_table(kind: Kind | None, existing: str | None, contact_id: str, expected: str) -> None:
-    assert admit_attach(kind, existing, contact_id) == expected
+    # the consent row mirrors the check's own contact in the ordinary (unshared) case
+    assert admit_attach(kind, existing, contact_id, consent_contact_id=existing) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "existing", "consent_contact", "contact_id", "expected"),
+    [
+        # A2b: a recompute row shares its original's consent row (K9); the consent's contact conflicts too.
+        pytest.param("quick", None, "c-1", "c-2", "conflict", id="A2b-shared-consent-other-contact"),
+        pytest.param("quick", None, "c-1", "c-1", "ok", id="A2b-shared-consent-same-contact-attaches"),
+        pytest.param("quick", "c-1", "c-2", "c-1", "conflict", id="A2b-beats-A3"),
+        pytest.param("quick", None, None, "c-1", "ok", id="no-consent-row"),
+        pytest.param("full", None, "c-1", "c-2", "not_quick", id="A2-beats-A2b"),
+        pytest.param(None, None, "c-1", "c-2", "not_found", id="A1-beats-A2b"),
+    ],
+)
+def test_admit_attach_reads_the_consent_rows_contact(
+    kind: Kind | None, existing: str | None, consent_contact: str | None, contact_id: str, expected: str
+) -> None:
+    assert admit_attach(kind, existing, contact_id, consent_contact_id=consent_contact) == expected
 
 
 # --------------------------------------------------------------------------- persist-time formulas (K8)

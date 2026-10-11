@@ -130,7 +130,7 @@ _RECOMPUTE_REFUSALS: Final[dict[str, tuple[int, str]]] = {
 _ATTACH_REFUSALS: Final[dict[str, tuple[int, str]]] = {
     "not_found": (404, CHECK_NOT_FOUND),
     "not_quick": (409, "attach_quick_only"),
-    "conflict": (409, "already_attached"),  # attached to a DIFFERENT contact (policy A4)
+    "conflict": (409, "already_attached"),  # the check or its consent row holds a DIFFERENT contact (A2b / A4)
 }
 # Defence in depth for any langsmith client this process builds without ours (the default client honours both).
 TRACE_HIDE_ENV: Final[dict[str, str]] = {"LANGSMITH_HIDE_INPUTS": "true", "LANGSMITH_HIDE_OUTPUTS": "true"}
@@ -741,8 +741,14 @@ async def post_attach(check_id: str, body: AttachRequest, request: Request) -> A
     repo = runtime_of(request.app).deps.repo
     canonical = _canonical_check_id(check_id)
     row = None if canonical is None else await run_in_threadpool(repo.get_check, canonical)
+    consent = (
+        await run_in_threadpool(repo.get_consent, row.consent_id) if row is not None and row.consent_id else None
+    )
     outcome = admit_attach(
-        row.kind if row is not None else None, row.contact_id if row is not None else None, body.contact_id
+        row.kind if row is not None else None,
+        row.contact_id if row is not None else None,
+        body.contact_id,
+        consent_contact_id=consent.contact_id if consent is not None else None,
     )
     if outcome in _ATTACH_REFUSALS or row is None:
         status, detail = _ATTACH_REFUSALS.get(outcome, (404, CHECK_NOT_FOUND))

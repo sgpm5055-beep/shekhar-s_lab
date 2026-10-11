@@ -63,7 +63,8 @@ from eligibility_agent.graph.state import Code, LockKind
 REPO_FILE = Path(repo_module.__file__)
 PACKAGE_ROOT = REPO_FILE.parents[1]  # eligibility_agent/
 
-# The 29 enumerated Repo protocol methods (the design says "27"; K4 fixes the count at 29).
+# The 30 enumerated Repo protocol methods (the design says "27"; K4 fixed the count at 29; T14 fix round 1 added
+# get_consent, which attach reads for the shared-consent conflict rule A2b).
 PROTOCOL_METHODS = (
     "insert_check",
     "update_check",
@@ -71,6 +72,7 @@ PROTOCOL_METHODS = (
     "record_check_error",
     "attach_contact",
     "insert_consent",
+    "get_consent",
     "get_pan_record",
     "put_pan_record",
     "get_score_cache",
@@ -287,7 +289,7 @@ def test_rows_are_frozen_slots_dataclasses(cls: type) -> None:
 def test_repo_protocol_is_the_29_enumerated_methods_and_both_backends_match_it() -> None:
     names = [n for n, _ in inspect.getmembers(Repo, inspect.isfunction) if not n.startswith("_")]
     assert sorted(names) == sorted(PROTOCOL_METHODS)
-    assert len(PROTOCOL_METHODS) == 29
+    assert len(PROTOCOL_METHODS) == 30
     for backend in (MemoryRepo, SupabaseRepo):
         for name in PROTOCOL_METHODS:
             expected = inspect.signature(getattr(Repo, name))
@@ -568,6 +570,15 @@ def test_insert_consent_stores_a_copy_and_rejects_duplicates() -> None:
     assert repo.list_consents() == [consent]
     with pytest.raises(ValueError):
         repo.insert_consent(consent)
+
+
+def test_get_consent_returns_a_copy_or_none() -> None:
+    repo = MemoryRepo(FrozenClock())
+    consent = make_consent(id="con-1")
+    repo.insert_consent(consent)
+    got = repo.get_consent("con-1")
+    assert got == consent and got is not consent
+    assert repo.get_consent("con-9") is None
 
 
 def test_attach_contact_updates_the_check_and_the_checks_consent() -> None:

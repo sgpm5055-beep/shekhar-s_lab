@@ -429,6 +429,8 @@ class Repo(Protocol):
     # ---- consents
     def insert_consent(self, row: ConsentRow) -> None: ...
 
+    def get_consent(self, consent_id: str) -> ConsentRow | None: ...  # attach reads the consent's contact (A2b)
+
     # ---- caches: plain upserts; stale rows are returned too (freshness is policy's call)
     def get_pan_record(self, pan_hash: str) -> PanRecordRow | None: ...
 
@@ -615,6 +617,9 @@ class MemoryRepo:
         if row.id in self._consents:
             raise ValueError(f"duplicate consent id {row.id!r}")
         self._consents[row.id] = copy.deepcopy(row)
+
+    def get_consent(self, consent_id: str) -> ConsentRow | None:
+        return copy.deepcopy(self._consents.get(consent_id))
 
     # ---- caches
 
@@ -1063,6 +1068,10 @@ class SupabaseRepo:
 
     def insert_consent(self, row: ConsentRow) -> None:
         self._insert("consents", row)
+
+    def get_consent(self, consent_id: str) -> ConsentRow | None:
+        data = self._select_one("consents", "id", consent_id)
+        return _decode(ConsentRow, data, ts=("given_at", "purge_after")) if data is not None else None
 
     # ---- caches
 
