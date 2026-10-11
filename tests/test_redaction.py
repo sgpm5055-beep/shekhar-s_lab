@@ -598,7 +598,7 @@ def test_refusal_messages_are_the_ruled_verbatim_strings() -> None:
         "IN_FLIGHT": "A check for this learner is already running. Please wait for it to finish.",
         "PAN_LOCKED": "This learner's PAN is temporarily locked while a previous check on it is verified. It will be available again once that check is resolved.",
         "WARN_NTC_RECENT": WARN_NTC_RECENT,
-        "PAN_CHANGE_NEEDS_MANAGER": "A report already exists for this opportunity, so changing the PAN needs a manager. This has been flagged for review.",
+        "PAN_CHANGE_NEEDS_MANAGER": "Changing the PAN on this opportunity needs a manager: a report already exists or the one allowed correction has been used. This has been flagged for review.",
         "LIVE_CALLS_DISABLED": "Eligibility checks are temporarily switched off on the server. Please try again later or contact the platform team.",
     }
 
