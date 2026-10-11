@@ -826,14 +826,23 @@ def test_every_confirm_string_derive_emi_can_emit_survives_the_scrub_and_reaches
     assert_clean(view)
 
 
-def test_items_to_confirm_are_empty_on_every_non_ok_branch() -> None:
+def test_items_to_confirm_survive_the_band_read_and_k7_views() -> None:
+    """T14 fix round 1 ruling (PRD 8.3): the confirm items are code-built before rank, so the band read and the K7 view
+    carry them (K7 constrains the lender fields only); an unverified PAN has no derived facts and shows none."""
     items = ("An account last updated 2026-03-12",)
     for over in (
         {"code": "NO_PINCODE_ON_PAN", "model": None, "safety": None},
         {"code": "OPENAI_FAILURE", "model": None, "safety": None},
     ):
-        assert build_lc_view(make_state(confirm_items=items, **over), ctx()).items_to_confirm == []
+        assert build_lc_view(make_state(confirm_items=items, **over), ctx()).items_to_confirm == list(items)
     assert build_lc_view(make_state(confirm_items=items, status="pan_not_verified"), ctx()).items_to_confirm == []
+
+
+def test_items_to_confirm_are_scrubbed_on_the_band_read_and_k7_views() -> None:
+    leaky = ("An account last updated 2026-03-12", "Experian flagged a/c no 12345")
+    for code in ("NO_PINCODE_ON_PAN", "OPENAI_FAILURE"):
+        view = build_lc_view(make_state(confirm_items=leaky, code=code, model=None, safety=None), ctx())
+        assert view.items_to_confirm == ["An account last updated 2026-03-12"]
 
 
 def test_items_to_confirm_are_still_shown_when_confidence_is_low() -> None:

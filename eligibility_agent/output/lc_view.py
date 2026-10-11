@@ -463,7 +463,8 @@ def _pan_not_verified_view(check_id: str, kind: Kind, ctx: RedactionContext) -> 
 
 
 def _band_read_view(state: CheckState, ctx: RedactionContext, check_id: str, kind: Kind) -> LcView:
-    """NO_PINCODE_ON_PAN: the band read only. Rank and safety never ran, so there is no confidence and no lender."""
+    """NO_PINCODE_ON_PAN: the band read only. Rank and safety never ran, so there is no confidence and no lender. The
+    code-built confirm items (PRD 8.3) still show."""
     headline = compute_headline(
         status="ok",
         band=_band_of(state),
@@ -484,6 +485,7 @@ def _band_read_view(state: CheckState, ctx: RedactionContext, check_id: str, kin
         confidence=None,
         coapplicant_suggested=suggested,
         pan_aadhaar_link_warning=_aadhaar_warning(state),
+        items_to_confirm=_items_to_confirm(state),  # code-built, pre-rank (PRD 8.3): shown whatever the lender path
         checked_on=_iso(ctx.checked_on),
         from_cache=ctx.from_cache,
         refresh_available_on=_iso(ctx.refresh_available_on),
@@ -495,7 +497,8 @@ def _openai_failure_view(state: CheckState, ctx: RedactionContext, check_id: str
     """K7. The ranking model failed twice: the band read plus up to two code-built gate survivors, with no numbers.
 
     The documented exception to 'low confidence means no lenders'. Model output, if the state holds any, is ignored:
-    none of its prose is trusted or shown.
+    none of its prose is trusted or shown. K7 constrains the lender fields only: the code-built confirm items (PRD 8.3,
+    built before rank) still show (T14 fix round 1 ruling).
     """
     band = _band_of(state)
     headline = compute_headline(
@@ -530,6 +533,7 @@ def _openai_failure_view(state: CheckState, ctx: RedactionContext, check_id: str
         alternates=alternates,
         coapplicant_suggested=suggested,
         pan_aadhaar_link_warning=_aadhaar_warning(state),
+        items_to_confirm=_items_to_confirm(state),  # K7 constrains the LENDER fields only (fix round 1 ruling)
         checked_on=_iso(ctx.checked_on),
         from_cache=ctx.from_cache,
         refresh_available_on=_iso(ctx.refresh_available_on),

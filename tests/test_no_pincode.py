@@ -152,6 +152,43 @@ def test_full_check_with_no_pincode_on_either_side_is_the_band_read(make_api: Ap
     assert_no_leak(body)
 
 
+def test_a_full_band_read_keeps_the_stale_account_confirm_item(make_api: ApiFactory) -> None:
+    """Fix round 1 ruling (PRD 8.3): confirm items are code-built before the gate, so the band read shows them. The
+    report's accounts carry no pincode (a fresh reported one, and a stale one last updated 2026-06-01)."""
+
+    def factory(sink: CallLogSink) -> FakeSurePassClient:
+        accounts = [
+            env.cais_account(
+                scheduled_emi="3500", current_balance="150000", date_reported="20260920", holder_zip="",
+                account_number="SYNTHACC0001",
+            ),
+            env.cais_account(
+                scheduled_emi="2000", current_balance="70000", date_reported="20260601", holder_zip="",
+                account_number="SYNTHACC0002",
+            ),
+        ]
+        return FakeSurePassClient(
+            pan={PAN_OK: env.pan_comprehensive_envelope(pan=PAN_OK, zip_code="")},
+            report={PAN_OK: env.experian_report_envelope(accounts=accounts, report_date=REPORT_DATE)},
+            sink=sink,
+        )
+
+    api = make_api(factory)
+
+    body = api.full(monthly_income=60000, existing_emi=OMIT)
+
+    assert (body["status"], body["code"], body["confidence"], body["headline"]) == (
+        "ok",
+        "NO_PINCODE_ON_PAN",
+        None,
+        "possible",
+    )
+    assert body["items_to_confirm"] == ["confirm with learner: an account last updated 2026-06-01"]
+    assert (body["top_lender"], body["alternates"]) == (None, [])
+    _assert_band_read_internal(api, body)
+    assert_no_leak(body)
+
+
 def test_a_bureau_side_pincode_lets_the_full_check_match_where_the_quick_could_not(make_api: ApiFactory) -> None:
     """PRD 8.6: quick uses the PAN pincode only; full uses PAN + bureau addresses (12 months). The PAN has none, the
     report's one account (EMI 3,500) carries 560001: the full check gates L1 / L2 and prices them normally (dossier money:

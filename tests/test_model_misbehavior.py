@@ -420,6 +420,22 @@ def test_k7_on_a_full_check_is_billed_but_never_counted(make_api: ApiFactory) ->
     _assert_k7_number_free(body)
 
 
+def test_k7_keeps_the_code_built_confirm_items(make_api: ApiFactory) -> None:
+    """Fix round 1 ruling (PRD 8.3): the stale / past-tenure confirm items are built by code before the model runs, so a
+    failed ranking does not hide them (K7 constrains only the lender fields)."""
+    api = make_api(lambda sink: full_emi_four_branch_scenario(sink=sink), rank=FakeRankModel.invalid_twice())
+
+    body = api.full(monthly_income=80000, existing_emi=OMIT)
+
+    assert (body["status"], body["code"], body["headline"]) == ("service_failure", "OPENAI_FAILURE", "possible")
+    assert body["items_to_confirm"] == [
+        "past tenure, confirm with learner",
+        "confirm with learner: an account last updated 2026-06-01",
+    ]
+    assert body["alternates"] == [K7_L1, K7_L2]
+    _assert_k7_number_free(body)
+
+
 @pytest.mark.parametrize("pick", ["L3", "L_NOT_IN_GATE"])
 def test_a_misbehaving_pick_never_reaches_the_view_at_any_confidence(make_api: ApiFactory, pick: str) -> None:
     """Even when the model claims high confidence for an out-of-gate top, the view shows only safety survivors."""
