@@ -21,8 +21,10 @@ from eligibility_agent.output.lc_view import LABEL_QUICK, REFUSAL_MESSAGES
 from eligibility_agent.surepass.client import PAN_ENDPOINT, REPORT_ENDPOINT, SCORE_ENDPOINT
 from eligibility_agent.testing.scenarios import full_happy_reported_emi_scenario
 from tests.helpers import (
+    MOBILE_OK,
     OPP,
     OPP_TWO,
+    PAN_FULL_NAME,
     PAN_OK,
     T0,
     Api,
@@ -123,7 +125,13 @@ def test_full_at_offer_reuses_the_pan_verified_10_days_ago_and_pulls_the_report_
     assert [c.endpoint for c in api.calls(row.id)] == [REPORT_ENDPOINT]
     assert (row.billed, row.counted_against_quota, row.is_refresh) == (True, False, False)
     assert row.billed == any(api.billable(row.id))
-    (consent,) = [c for c in api.repo.list_consents() if c.id == row.consent_id]
+    # the Report request carries the STORED PAN record's full_name (reuse path), never the LC-typed name
+    report_call = api.surepass.calls[-1]
+    assert (report_call.endpoint, report_call.body) == (
+        REPORT_ENDPOINT,
+        {"name": PAN_FULL_NAME, "mobile": MOBILE_OK, "pan": PAN_OK, "consent": "Y"},
+    )
+    consent = api.consent(row.id)
     assert (consent.covers, consent.wording_version, consent.opportunity_id) == ("report", "v2-full", OPP)
 
     pan_hash = pan_hash_of(PAN_OK)
@@ -210,6 +218,8 @@ def test_refresh_inside_the_report_window_is_refused_then_billed_after_31_days(m
     row = api.row(refreshed["check_id"])
     assert (row.billed, row.counted_against_quota, row.is_refresh) == (True, False, True)
     assert row.billed == any(api.billable(row.id))
+    assert api.consent(row.id).covers == "report"  # a consent record for THIS pull
+    assert api.surepass.calls[-1].body["name"] == PAN_FULL_NAME
     assert_no_leak(refreshed)
 
 

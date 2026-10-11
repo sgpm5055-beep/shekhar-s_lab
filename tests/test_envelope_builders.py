@@ -627,6 +627,17 @@ def test_full_happy_reported_emi_scenario_one_reported_account() -> None:
     assert account["Date_Closed"] == "" and account["Account_Status"] == "11"
     assert [r["ZIP_Postal_Code_non_normalized"] for r in account["CAIS_Holder_Address_Details"]] == ["560001"]
     assert cast("dict[str, Any]", _pan(client, scn.PAN_OK).data)["address"]["zip"] == "560001"
+    with pytest.raises(AssertionError, match="unexpected SurePass call"):
+        _score(client, scn.PAN_OK)  # full worlds wire PAN + Report only by default
+
+
+def test_full_happy_reported_emi_scenario_with_score_also_answers_the_score_endpoint() -> None:
+    client = scn.full_happy_reported_emi_scenario(with_score=True)
+    score = cast("dict[str, Any]", _score(client, scn.PAN_OK).data)
+    assert score["credit_score"] == "745"
+    assert score["credit_report"]["CreditProfileHeader"]["ReportDate"] == "20261001"
+    report = cast("dict[str, Any]", _report(client, scn.PAN_OK).data)
+    assert report["credit_report"]["CAIS_Account"]["CAIS_Account_DETAILS"][0]["Scheduled_Monthly_Payment_Amount"] == "3500"
 
 
 def test_full_emi_four_branch_scenario_is_the_six_account_table() -> None:

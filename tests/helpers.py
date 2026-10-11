@@ -12,11 +12,11 @@ structurally (T9 ruling).
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -27,6 +27,7 @@ from eligibility_agent.config import Settings
 from eligibility_agent.db.repo import (
     CheckRow,
     CheckStatus,
+    ConsentRow,
     MemoryRepo,
     PanLockRow,
     PanRecordRow,
@@ -128,13 +129,29 @@ def known(**values: Any) -> dict[str, dict[str, Any]]:
     return {key: {"value": value, "status": "known"} for key, value in values.items()}
 
 
+def frozen_criteria(criteria: Mapping[str, Mapping[str, Any]]) -> Mapping[str, Mapping[str, Any]]:
+    """A read-only view (outer AND per-field mappings): SEED_LENDERS is imported by evals and the seed script, so no
+    importer may mutate the single source in place."""
+    return MappingProxyType({key: MappingProxyType(dict(entry)) for key, entry in criteria.items()})
+
+
+def seed_criteria(**values: Any) -> Mapping[str, Mapping[str, Any]]:
+    """``known(**values)``, frozen: the form every SEED_LENDERS entry carries."""
+    return frozen_criteria(known(**values))
+
+
+def criteria_json(criteria: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """A fresh, plain, JSON-ready copy of a criteria mapping (what a repo / the lenders.criteria jsonb receives)."""
+    return {key: dict(entry) for key, entry in criteria.items()}
+
+
 @dataclass(frozen=True, slots=True)
 class SeedLender:
     """One published lender version + its approved pincodes, exactly as the admin tables hold it."""
 
     id: str
     name: str
-    criteria: Mapping[str, Any]  # schema.sql spellings only
+    criteria: Mapping[str, Mapping[str, Any]]  # schema.sql spellings only; read-only (frozen_criteria) in SEED_LENDERS
     policy_notes: str
     pincodes: tuple[str, ...]
     version: int = 1
@@ -144,7 +161,7 @@ SEED_LENDERS: Final[tuple[SeedLender, ...]] = (
     SeedLender(
         id="L1",
         name="Alpha Education Finance",
-        criteria=known(
+        criteria=seed_criteria(
             min_score_floor=650,
             ntc_accepted=False,
             foir_limit=0.55,
@@ -164,7 +181,7 @@ SEED_LENDERS: Final[tuple[SeedLender, ...]] = (
     SeedLender(
         id="L2",
         name="Bharat Upskill Credit",
-        criteria=known(
+        criteria=seed_criteria(
             min_score_floor=650,
             ntc_accepted=True,
             foir_limit=0.45,
@@ -184,7 +201,7 @@ SEED_LENDERS: Final[tuple[SeedLender, ...]] = (
     SeedLender(
         id="L3",
         name="Crest Capital NBFC",
-        criteria=known(
+        criteria=seed_criteria(
             min_score_floor=720,
             ntc_accepted=False,
             foir_limit=0.60,
@@ -210,7 +227,7 @@ def seed_lender_row(repo: MemoryRepo, lender: SeedLender, *, published: bool = T
         lender.version,
         lender.name,
         published,
-        copy.deepcopy(dict(lender.criteria)),
+        criteria_json(lender.criteria),
         lender.policy_notes,
         lender.pincodes,
     )
@@ -370,27 +387,10 @@ class SwitchableSurePass:
         return self._current.experian_report(check_id, pan_hash, name=name, mobile=mobile, pan=pan)
 
 
-def happy_report_envelope() -> env.EnvelopePair:
-    """The full_happy_reported_emi world's report: ONE open account, reported EMI 3500, ReportDate 20261001, score 745."""
-    account = env.cais_account(
-        scheduled_emi="3500",
-        current_balance="150000",
-        date_reported="20260920",
-        holder_zip="560001",
-        account_number="SYNTHACC0001",
-    )
-    return env.experian_report_envelope(accounts=[account], credit_score="745", report_date=scenarios.REPORT_DATE)
-
-
 def quick_and_full_client(sink: CallLogSink, *, pan: str = PAN_OK) -> FakeSurePassClient:
-    """PAN + Score + Report for one PAN (the scenario factories wire quick worlds PAN+Score and full worlds PAN+Report
-    only; quick-then-full flows need all three, T5 note)."""
-    return FakeSurePassClient(
-        pan={pan: env.pan_comprehensive_envelope(pan=pan)},
-        score={pan: env.experian_score_envelope(credit_score="745")},
-        report={pan: happy_report_envelope()},
-        sink=sink,
-    )
+    """PAN + Score + Report for one PAN: the full_happy_reported_emi world with its Score endpoint wired too (scenario
+    factories wire quick worlds PAN+Score and full worlds PAN+Report by default; quick-then-full flows need all three)."""
+    return scenarios.full_happy_reported_emi_scenario(pan, sink=sink, with_score=True)
 
 
 # --------------------------------------------------------------------------- the API harness
@@ -441,6 +441,13 @@ class Api:
     def calls(self, check_id: str) -> list[SurePassCallRow]:
         """Insertion order (under a frozen clock the protocol's (called_at, id) order is uuid order)."""
         return self.repo.list_calls(check_id)
+
+    def consent(self, check_id: str) -> ConsentRow:
+        """The consent row the check's ``consent_id`` points at (one per pull, PRD 5.1 / 11)."""
+        consent_id = self.row(check_id).consent_id
+        matches = [c for c in self.repo.list_consents() if c.id == consent_id]
+        assert consent_id is not None and len(matches) == 1, check_id
+        return matches[0]
 
     def billable(self, check_id: str) -> list[bool]:
         return [call.billable for call in self.calls(check_id)]

@@ -130,9 +130,12 @@ def _full_world(
     )
 
 
-def full_happy_reported_emi_scenario(pan: str = PAN_OK, *, sink: CallLogSink | None = None) -> FakeSurePassClient:
+def full_happy_reported_emi_scenario(
+    pan: str = PAN_OK, *, sink: CallLogSink | None = None, with_score: bool = False
+) -> FakeSurePassClient:
     """ONE open account with a REPORTED EMI ``"3500"`` (Date_Reported 20260920), ReportDate 20261001, zips 560001,
-    score ``"745"``. Drives the HIGH-confidence full-check test."""
+    score ``"745"``. Drives the HIGH-confidence full-check test. ``with_score=True`` also wires the Score endpoint
+    (same score, same ReportDate) for quick-then-full flows."""
     account = env.cais_account(
         scheduled_emi="3500",
         current_balance="150000",
@@ -140,7 +143,7 @@ def full_happy_reported_emi_scenario(pan: str = PAN_OK, *, sink: CallLogSink | N
         holder_zip="560001",
         account_number="SYNTHACC0001",
     )
-    return _full_world(pan, pan_zip="560001", accounts=[account], sink=sink)
+    return _full_world(pan, pan_zip="560001", accounts=[account], sink=sink, with_score=with_score)
 
 
 def full_emi_four_branch_scenario(pan: str = PAN_OK, *, sink: CallLogSink | None = None) -> FakeSurePassClient:

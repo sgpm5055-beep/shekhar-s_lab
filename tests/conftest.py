@@ -9,8 +9,8 @@ primary no-network guarantee stays pytest-socket (``--disable-socket`` in addopt
 
 Fixtures: ``clock`` (FrozenClock at T0 = 2026-10-10 10:00 IST), ``repo`` (MemoryRepo on that clock, the K17 seed lenders
 L1/L2/L3 published), ``fake_rank`` (FakeRankModel happy path) and ``make_api``: a factory that wires one SurePass fake
-(logging into the repo sink) into ``GraphDeps(repo, surepass, rank_model=FakeRankModel(), prompts, now=clock.now)``,
-builds the app from those deps with ``create_app`` and returns a started TestClient harness (bearer header attached).
+(logging into the repo sink), the FakeRankModel, local prompts and ``now=clock.now`` into ``create_app``, exposes the app's
+RUNTIME ``GraphDeps`` (``runtime_of(app).deps``) on the harness and returns a started TestClient (bearer attached).
 """
 
 from __future__ import annotations
@@ -25,9 +25,8 @@ from fastapi.testclient import TestClient
 
 from eligibility_agent.config import Settings
 from eligibility_agent.db.repo import MemoryRepo
-from eligibility_agent.graph.build import GraphDeps
 from eligibility_agent.graph.prompts import local_prompts
-from eligibility_agent.main import create_app
+from eligibility_agent.main import create_app, runtime_of
 from eligibility_agent.testing.clock import FrozenClock
 from eligibility_agent.testing.fake_llm import FakeRankModel
 from tests.helpers import (
@@ -105,15 +104,16 @@ def make_api(clock: FrozenClock, repo: MemoryRepo, fake_rank: FakeRankModel) -> 
         ) -> Api:
             fake = surepass(repo)
             model = rank if rank is not None else fake_rank
-            deps = GraphDeps(repo=repo, surepass=fake, rank_model=model, prompts=local_prompts(), now=clock.now)
             app = create_app(
                 settings if settings is not None else api_settings(),
-                repo=deps.repo,
-                surepass=deps.surepass,
-                rank_model=deps.rank_model,
-                prompts=deps.prompts,
-                now=deps.now,
+                repo=repo,
+                surepass=fake,
+                rank_model=model,
+                prompts=local_prompts(),
+                now=clock.now,
             )
+            deps = runtime_of(app).deps  # the GraphDeps the app's graphs actually run on, not a parallel copy
+            assert (deps.repo, deps.surepass, deps.rank_model, deps.now) == (repo, fake, model, clock.now)
             client = stack.enter_context(TestClient(app, headers=AUTH))
             return Api(clock=clock, repo=repo, surepass=fake, rank=model, deps=deps, app=app, client=client)
 

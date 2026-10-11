@@ -125,6 +125,7 @@ def test_score_timeout_is_pending_verification_then_gated_until_the_review_is_re
     assert api.endpoints() == [PAN_ENDPOINT, SCORE_ENDPOINT, SCORE_ENDPOINT]  # PAN record reused
     retry = api.row(admitted["check_id"])
     assert (retry.billed, retry.counted_against_quota) == (True, True)  # still no stored score: this one counts
+    assert api.consent(retry.id).covers == "score"  # its own consent record for the re-pull
 
 
 def test_report_timeout_locks_even_cache_hits_then_gates_only_billed_pulls(make_api: ApiFactory) -> None:

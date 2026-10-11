@@ -16,10 +16,12 @@ from eligibility_agent.graph.state import Code
 from eligibility_agent.output.lc_view import MSG_OPENAI_FAILURE, REFUSAL_MESSAGES
 from eligibility_agent.surepass.client import PAN_ENDPOINT, REPORT_ENDPOINT, SCORE_ENDPOINT
 from eligibility_agent.testing.fake_llm import FakeRankModel
-from eligibility_agent.testing.scenarios import happy_quick_scenario
+from eligibility_agent.testing.scenarios import happy_quick_scenario, score_failure_scenario
 from tests.helpers import (
     LC_A,
     LC_B,
+    MOBILE_OK,
+    PAN_FULL_NAME,
     PAN_OK,
     IST,
     PAN_TWO,
@@ -127,6 +129,9 @@ def test_expired_score_refresh_is_billed_but_not_counted(make_api: ApiFactory) -
     assert [c.endpoint for c in api.calls(row.id)] == [SCORE_ENDPOINT]
     assert (row.billed, row.counted_against_quota, row.is_refresh) == (True, False, True)
     assert row.billed == any(api.billable(row.id))
+    assert api.consent(row.id).covers == "score"  # a consent record for THIS pull
+    # the refresh re-adapts the STORED PAN record: its full_name, never the LC-typed name, goes to the bureau
+    assert api.surepass.calls[-1].body == {"name": PAN_FULL_NAME, "mobile": MOBILE_OK, "pan": PAN_OK, "consent": "Y"}
     score = api.repo.get_score_cache(pan_hash_of(PAN_OK))
     assert score is not None and score.fetched_at == T0 + timedelta(days=31)
     assert api.repo.quick_checks_used_today(LC_A) == 0
@@ -202,6 +207,40 @@ def test_three_billed_bureau_calls_cap_the_pan_for_the_ist_day(make_api: ApiFact
     refreshed = api.quick()
     assert (refreshed["status"], refreshed["from_cache"]) == ("ok", False)
     assert api.endpoints()[4:] == [SCORE_ENDPOINT]
+
+
+def test_three_resolved_score_timeouts_also_cap_the_pan(make_api: ApiFactory) -> None:
+    """The natural cap path: timed-out Score calls are billable (spend unknown, K17), so they count toward the 3-per-PAN
+    cap. Each timeout is reconciled (review resolved) and retried after its 10-minute lock: 10:00, 10:11 and 10:22 IST.
+    The fourth attempt, with every lock expired and every review resolved, is refused by the cap alone."""
+    api = make_api(lambda sink: score_failure_scenario("timeout", sink=sink))
+    pan_hash = pan_hash_of(PAN_OK)
+
+    for minute in (0, 11, 22):
+        api.clock.set_now(ist(2026, 10, 10, 10, minute))
+        for review in api.reviews(PAN_OK, "timeout_reconciliation"):
+            if review.resolved_at is None:
+                api.repo.resolve_review(review.id, resolved_by="ops")
+        pending = api.quick()
+        assert (pending["status"], pending["code"]) == ("pending_verification", None)
+        assert api.row(pending["check_id"]).counted_against_quota is False
+
+    assert api.endpoints() == [PAN_ENDPOINT, SCORE_ENDPOINT, SCORE_ENDPOINT, SCORE_ENDPOINT]  # PAN reused after call 1
+    score_rows = [c for c in api.repo.list_calls() if c.endpoint == SCORE_ENDPOINT]
+    assert [(c.error_kind, c.http_status, c.billable) for c in score_rows] == [("timeout", None, True)] * 3
+    assert api.repo.bureau_calls_today(pan_hash) == 3
+
+    api.clock.set_now(ist(2026, 10, 10, 10, 33))
+    (last,) = [r for r in api.reviews(PAN_OK, "timeout_reconciliation") if r.resolved_at is None]
+    api.repo.resolve_review(last.id, resolved_by="ops")
+    assert api.active_lock_kinds(PAN_OK) == []  # nothing else stands in the way
+    fourth = api.quick()
+
+    _assert_refused(api, fourth, "PAN_DAILY_CAP", left=5)  # no timeout ever counted
+    assert len(api.endpoints()) == 4
+    (lock,) = api.locks(PAN_OK, "daily_cap")
+    assert lock.lock_until == ist(2026, 10, 11)
+    assert len(api.reviews(PAN_OK, "pan_daily_cap")) == 1
 
 
 # --------------------------------------------------------------------------- the IST day boundary (quota + caps)

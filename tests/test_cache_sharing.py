@@ -9,6 +9,7 @@ raw lower 1.5 x 367,536.02 = 551,304.03 -> 551,000. L2 0.45 x 90,000 = 40,500 = 
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 from typing import Any
 
@@ -23,6 +24,7 @@ from tests.helpers import (
     Api,
     ApiFactory,
     assert_no_leak,
+    criteria_json,
     internal_of,
     known,
     seed_lender,
@@ -118,3 +120,18 @@ def test_same_lc_repeat_on_a_later_day_is_a_free_hit(make_api: ApiFactory) -> No
     assert api.endpoints() == [PAN_ENDPOINT, SCORE_ENDPOINT]
     row = api.row(again["check_id"])
     assert (row.billed, row.counted_against_quota) == (False, False)
+
+
+def test_seed_lenders_are_a_read_only_single_source() -> None:
+    """K17: evals and the seed script import SEED_LENDERS; no importer can edit it in place (outer or per-field)."""
+    l1 = seed_lender("L1")
+    criteria: Any = l1.criteria
+    with pytest.raises(TypeError):
+        criteria["loan_max"] = {"value": 1, "status": "known"}
+    with pytest.raises(TypeError):
+        criteria["loan_max"]["value"] = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(l1, "name", "Renamed")
+    plain = criteria_json(l1.criteria)
+    plain["loan_max"]["value"] = 1  # a fresh copy is freely editable ...
+    assert seed_lender("L1").criteria["loan_max"] == {"value": 1500000, "status": "known"}  # ... and never aliases
