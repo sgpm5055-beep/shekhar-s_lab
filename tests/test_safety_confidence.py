@@ -1075,6 +1075,82 @@ def test_headline_d_low_with_a_survivor_and_a_gated_list_is_under_review() -> No
     assert headline(final_conf="low", safety=safety_result(top="L1"), gated=[gl("L1")]) == "under_review"
 
 
+# ---- (c') PRD 9.4: "No lender surviving the gate OR THE BAND is one path: low, 'Not fundable alone'".
+# A compliant model that names nobody because every gated floor is known and failed has demoted nothing, so row c's
+# demotion clause cannot fire; the band itself decides. An unknown / uncertain floor keeps the review headline.
+
+NOBODY = safety_result(top=None, none_survived=True, clears=None, demoted=[])
+
+
+def test_headline_c_prime_a_model_that_names_nobody_when_every_gated_floor_fails_is_not_fundable_alone() -> None:
+    gated = [gl("L1", score_floor=650), gl("L2", score_floor=700)]
+    assert headline(band="<650", final_conf="low", safety=NOBODY, gated=gated) == "not_fundable_alone"
+
+
+def test_headline_c_prime_ntc_where_no_gated_lender_accepts_ntc_is_not_fundable_alone() -> None:
+    gated = [gl("L1", ntc_accepted=False), gl("L2", ntc_accepted=False)]
+    assert headline(band="NTC", final_conf="low", safety=NOBODY, gated=gated) == "not_fundable_alone"
+
+
+def test_headline_c_prime_one_lender_the_band_clears_keeps_under_review() -> None:
+    """L2's floor (600, bucket '<650') is cleared by band '<650': not every floor failed, so nobody-named is a review."""
+    gated = [gl("L1", score_floor=650), gl("L2", score_floor=600)]
+    assert headline(band="<650", final_conf="low", safety=NOBODY, gated=gated) == "under_review"
+
+
+def test_headline_c_prime_one_ntc_accepting_lender_keeps_under_review() -> None:
+    gated = [gl("L1", ntc_accepted=False), gl("L2", ntc_accepted=True)]
+    assert headline(band="NTC", final_conf="low", safety=NOBODY, gated=gated) == "under_review"
+
+
+def test_headline_c_prime_a_missing_floor_on_any_gated_lender_keeps_under_review() -> None:
+    gated = [gl("L1", score_floor=650), gl("L2", score_floor=None)]
+    assert headline(band="<650", final_conf="low", safety=NOBODY, gated=gated) == "under_review"
+    unknown_ntc = [gl("L1", ntc_accepted=False), gl("L2", ntc_accepted=None)]
+    assert headline(band="NTC", final_conf="low", safety=NOBODY, gated=unknown_ntc) == "under_review"
+
+
+def test_headline_c_prime_an_uncertain_floor_on_any_gated_lender_keeps_under_review() -> None:
+    gated = [gl("L1", score_floor=650), gl("L2", score_floor=650, field_status={"score_floor": "uncertain"})]
+    assert headline(band="<650", final_conf="low", safety=NOBODY, gated=gated) == "under_review"
+    uncertain_ntc = [gl("L1", ntc_accepted=False, field_status={"ntc_accepted": "uncertain"})]
+    assert headline(band="NTC", final_conf="low", safety=NOBODY, gated=uncertain_ntc) == "under_review"
+
+
+def test_headline_c_prime_needs_a_non_empty_gate_and_a_known_band() -> None:
+    assert headline(band="<650", final_conf="low", safety=NOBODY, gated=[]) == "not_fundable_alone"  # row c's empty gate
+    assert headline(band=None, final_conf="low", safety=NOBODY, gated=[gl("L1")]) == "under_review"
+
+
+def test_headline_c_prime_helper_never_claims_nothing_fits_for_an_empty_gate_or_unknown_band() -> None:
+    assert safety_module._band_fails_every_gated_floor("<650", []) is False  # vacuous truth is not a failed floor
+    assert safety_module._band_fails_every_gated_floor("<650", None) is False
+    assert safety_module._band_fails_every_gated_floor(None, [gl("L1")]) is False
+    assert safety_module._band_fails_every_gated_floor("<650", [gl("L1", score_floor=650)]) is True
+
+
+def test_headline_c_prime_a_surviving_top_is_unchanged() -> None:
+    """A survivor means someone fits the band: the new row needs ``safety.top is None``."""
+    survivor = safety_result(top="L1", clears=None, demoted=[])
+    assert headline(band="<650", final_conf="low", safety=survivor, gated=[gl("L1", score_floor=700)]) == "under_review"
+    assert headline(band="<650", final_conf="medium", safety=survivor, gated=[gl("L1", score_floor=700)]) == "possible"
+
+
+def test_headline_c_prime_the_k7_pair_keeps_its_band_derived_headline() -> None:
+    """The model-failed run is NOT the 'no lender fits' path even when every floor fails: K7 is band-derived."""
+    gated = [gl("L1", score_floor=650)]
+    assert headline(status="service_failure", code="OPENAI_FAILURE", band="<650", final_conf="low", safety=None, gated=gated) == "unlikely"
+    assert headline(status="service_failure", code="OPENAI_FAILURE", band="NTC", final_conf="low", safety=NOBODY, gated=gated) == "unlikely"
+
+
+def test_headline_c_prime_the_demotion_driven_rows_are_unchanged() -> None:
+    gated = [gl("L1", score_floor=650)]
+    floor_demoted = safety_result(top=None, none_survived=True, clears=None, demoted=[breach("band_floor")])
+    assert headline(band="<650", final_conf="low", safety=floor_demoted, gated=gated) == "not_fundable_alone"
+    other = safety_result(top=None, none_survived=True, clears=None, demoted=[breach("foir_limit")])
+    assert headline(band="720-780", final_conf="low", safety=other, gated=gated) == "under_review"  # floor cleared: no row c'
+
+
 # ---- F3: the demotion-driven rows (c's demotion clause, d) need that NOTHING survived
 
 def test_headline_f3_a_surviving_top_with_a_band_floor_demoted_alternate_is_not_not_fundable_alone() -> None:

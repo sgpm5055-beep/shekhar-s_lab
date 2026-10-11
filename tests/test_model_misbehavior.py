@@ -181,6 +181,75 @@ def test_a_below_floor_pick_is_demoted_and_none_surviving_is_not_fundable_alone(
     assert_no_leak(body)
 
 
+def _band_610(make_api: ApiFactory, rank: FakeRankModel | None = None) -> Api:
+    """Score 610 -> band '<650'; PAN zip 560001 gates L1 and L2, both with a 650 floor: no gated lender's floor is met."""
+    return make_api(lambda sink: happy_quick_scenario(score="610", sink=sink), rank=rank)
+
+
+def test_a_compliant_model_that_names_nobody_below_every_floor_is_not_fundable_alone(make_api: ApiFactory) -> None:
+    """PRD 9.4: 'No lender surviving the gate OR THE BAND is one path: low, Not fundable alone, co_applicant_suggested true,
+    review queue'. The default (compliant) fake sees every floor fail and recommends nobody, so safety has NOTHING to
+    demote; the band alone must decide (it used to read 'under_review')."""
+    api = _band_610(make_api)
+
+    body = api.quick()
+
+    assert (body["status"], body["code"], body["confidence"], body["headline"]) == (
+        "ok",
+        None,
+        "low",
+        "not_fundable_alone",
+    )
+    assert (body["top_lender"], body["alternates"], body["coapplicant_suggested"]) == (None, [], True)
+    assert body["coapplicant_reason"]  # the model's scrubbed reason rides along
+    check_id = body["check_id"]
+    internal = internal_of(api.row(check_id))
+    assert (internal["derived"]["band"], internal["gated_lender_ids"]) == ("<650", ["L1", "L2"])
+    assert internal["model_output"]["recommendation"] is None and internal["model_output"]["alternates"] == []
+    assert _demotions(api, check_id) == []  # nothing was demoted: the model declined every lender itself
+    assert internal["safety"]["none_survived"] is True
+    assert _review_kinds(api, check_id) == ["not_fundable_pattern"]  # PRD 9.4: the review queue sees the pattern
+    assert api.rank.call_count == 1
+    row = api.row(check_id)
+    assert (row.status, row.billed, row.counted_against_quota) == ("ok", True, True)
+    assert_no_leak(body)
+
+
+def test_an_uncertain_floor_on_a_gated_lender_keeps_the_review_headline(make_api: ApiFactory) -> None:
+    """The admin marked L1's floor 'uncertain': the band's failure of it is not KNOWN, so 'not fundable alone' would be a
+    claim the criteria cannot support. Nobody named + an unsure floor stays 'under_review' (still low, still reviewed)."""
+    api = _band_610(make_api)
+    l1 = seed_lender("L1")
+    criteria = criteria_json(l1.criteria)
+    criteria["min_score_floor"] = {"value": 650, "status": "uncertain"}
+    api.repo.set_lender_published("L1", 1, False)
+    api.repo.seed_lender("L1", 2, l1.name, True, criteria, l1.policy_notes, l1.pincodes)
+
+    body = api.quick()
+
+    assert (body["confidence"], body["headline"], body["top_lender"]) == ("low", "under_review", None)
+    assert body["coapplicant_suggested"] is True  # the fake's own thin-band nudge; the headline rule is what differs
+    assert internal_of(api.row(body["check_id"]))["gated_lender_ids"] == ["L1", "L2"]
+    assert_no_leak(body)
+
+
+def test_the_k7_view_on_a_failed_band_keeps_its_band_derived_headline(make_api: ApiFactory) -> None:
+    """The model failing twice is NOT the 'no lender fits' path even when every floor fails: K7 stays band-derived
+    ('unlikely' for band '<650'), never 'not_fundable_alone'."""
+    api = _band_610(make_api, FakeRankModel.invalid_twice())
+
+    body = api.quick()
+
+    assert (body["status"], body["code"], body["headline"], body["confidence"]) == (
+        "service_failure",
+        "OPENAI_FAILURE",
+        "unlikely",
+        "low",
+    )
+    assert _review_kinds(api, body["check_id"]) == ["openai_failure"]
+    assert_no_leak(body)
+
+
 def test_a_demoted_top_promotes_the_surviving_alternates_and_still_goes_to_review(make_api: ApiFactory) -> None:
     """K11: safety_demoted_all fires whenever the model's TOP pick did not survive, even with survivors to show."""
     api = _happy(make_api, FakeRankModel([ranked_output("L_NOT_IN_GATE", "L1", "L2")]))

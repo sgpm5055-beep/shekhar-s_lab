@@ -314,6 +314,29 @@ def _every_demotion_is_floor_or_headroom(safety: SafetyResult | None) -> bool:
     )
 
 
+def _band_fails_every_gated_floor(band: Band | None, gated: Sequence[GatedLender] | None) -> bool:
+    """PRD 9.4 "no lender surviving the gate OR THE BAND": the gate is non-empty and the band fails EVERY gated lender's
+    floor, each floor KNOWN. A floor is known when its value is present and the admin did not mark it ``'uncertain'``:
+    a scored band needs ``score_floor`` below the band's bucket; NTC needs ``ntc_accepted`` explicitly False. An unknown
+    (None) or uncertain floor on ANY gated lender, an empty gate or an unknown band is False: the claim "nothing fits"
+    is only made on facts the criteria support."""
+    if band is None or not gated:
+        return False
+    for lender in gated:
+        c = lender.criteria
+        if band == "NTC":
+            known, failed = c.ntc_accepted is not None, c.ntc_accepted is False
+            status = c.field_status.get("ntc_accepted")
+        else:
+            floor = c.score_floor
+            known = floor is not None
+            failed = floor is not None and BAND_ORDER[band] < BAND_ORDER[band_from_score(floor)]
+            status = c.field_status.get("score_floor")
+        if not known or status == "uncertain" or not failed:
+            return False
+    return True
+
+
 def compute_headline(
     *,
     status: LcStatus,
@@ -335,7 +358,9 @@ def compute_headline(
     | b   | ``code == 'NO_PINCODE_ON_PAN'`` (band read): band NTC / '<650'; any other band    | unlikely; possible   |
     | e   | ``code == 'OPENAI_FAILURE'``: the same band-derived mapping (K7, never review)    | unlikely; possible   |
     | c   | final low AND (gate empty, OR nothing survived AND every demotion was band_floor  | not_fundable_alone   |
-    |     | / no-headroom)                                                                    |                      |
+    |     | / no-headroom, OR nothing survived AND the gate is non-empty AND the band fails   |                      |
+    |     | every gated lender's KNOWN floor: PRD 9.4 "no lender surviving the gate or the    |                      |
+    |     | band is one path", whether the model declined them or safety demoted them)        |                      |
     | d   | final low, nothing survived, any other demotion mix / nothing returned / no       | under_review         |
     |     | safety result                                                                     |                      |
     | f   | band NTC and a pick survived (an NTC-accepting lender)                            | unlikely             |
@@ -358,7 +383,9 @@ def compute_headline(
         if not gated:
             return "not_fundable_alone"
         if not survivor:
-            return "not_fundable_alone" if _every_demotion_is_floor_or_headroom(safety) else "under_review"
+            if _every_demotion_is_floor_or_headroom(safety) or _band_fails_every_gated_floor(band, gated):
+                return "not_fundable_alone"
+            return "under_review"
     if band == "NTC" and survivor:
         return "unlikely"
     if survivor and final_conf == "high":
