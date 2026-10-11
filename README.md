@@ -384,7 +384,7 @@ set resolved_at = now(), resolved_by = 'your.name'
 where id = '<review id>' and resolved_at is null;
 ```
 
-Resolving the row does **not** release the 10-minute timeout lock. While that lock is active every request on the PAN gets
+Resolving the row does **not** release the 10-minute timeout lock. While that lock is active every quick or full check on the PAN gets
 `PAN_LOCKED` (cache hits included); once it has expired, an unresolved review row keeps refusing billed pulls (cache hits are
 served again). A billed re-pull is admitted only when **both** have cleared: the lock has expired **and** the row is resolved,
 so resolving early still leaves the PAN locked until the 10 minutes are up.
