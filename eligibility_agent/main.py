@@ -16,10 +16,12 @@ persisted as a checks row; the only non-200s are 401 (bearer), 422 (schema) and 
 sit OUTSIDE the LcView shape. A 5xx would invite blind retries that can double-bill SurePass.
 
 Validation (schema = 422, nothing recorded): ``consent.given`` must be the JSON boolean ``true`` (owner ruling), the PAN
-and mobile are normalised by ``policy.guards`` (the only normalisers / hashers), declared money is a finite non-negative
-JSON number, the quick body has NO ``refresh`` field (``extra='forbid'``), and ``opportunity_stage`` must be an
-``OpportunityStage`` member (stored verbatim; the ordering gate is a STAGE_TOO_EARLY refusal). The 422 handler returns
-``loc`` / ``msg`` / ``type`` only: FastAPI's ``input`` / ``ctx`` echo would reflect the PAN, mobile and name.
+and mobile are normalised by ``policy.guards`` (the only normalisers / hashers), the caller identifiers (lc / lead /
+opportunity / contact ids) are stripped and must be non-blank, declared money is a finite JSON number (income strictly
+positive, EMI non-negative), the quick body has NO ``refresh`` field (``extra='forbid'``), and ``opportunity_stage`` must
+be an ``OpportunityStage`` member (stored verbatim; the ordering gate is a STAGE_TOO_EARLY refusal). The 422 handler
+returns ``loc`` / ``msg`` / ``type`` only: FastAPI's ``input`` / ``ctx`` echo would reflect the PAN, mobile and name, and
+an unknown key's NAME is masked in ``loc`` (a caller-chosen key can be PAN-shaped).
 
 Error boundary (T11 rulings, binding): ``graph.invoke`` runs in the threadpool under ``asyncio.wait_for`` with
 ``GRAPH_TIMEOUT_SECONDS``. A raise, or a final state without a usable view, goes through ``nodes.fail_check`` (billed
@@ -41,6 +43,7 @@ import asyncio
 import hmac
 import logging
 import os
+import threading
 import uuid
 from collections.abc import AsyncGenerator, Callable, Mapping, MutableMapping
 from contextlib import asynccontextmanager
@@ -92,6 +95,7 @@ from eligibility_agent.surepass.client import LiveSurePassClient, SurePassClient
 __all__ = [
     "AUTH_ERROR_DETAIL",
     "CHECK_NOT_FOUND",
+    "EXTRA_FIELD_LOC",
     "MAX_DECLARED_AMOUNT",
     "ROUTE_TIMEOUT_MESSAGE",
     "AppRuntime",
@@ -116,6 +120,7 @@ MAX_DECLARED_AMOUNT: Final[float] = 100_000_000.0  # INR per month; a sanity cei
 AUTH_ERROR_DETAIL: Final[str] = "invalid_or_missing_token"
 CHECK_NOT_FOUND: Final[str] = "check_not_found"
 ROUTE_TIMEOUT_MESSAGE: Final[str] = "route: graph timeout"
+EXTRA_FIELD_LOC: Final[str] = "<extra field>"  # replaces an unknown key's name in a 422 ``loc``: never echo caller keys
 # K9 transport details (outside the LcView shape).
 _RECOMPUTE_REFUSALS: Final[dict[str, tuple[int, str]]] = {
     "not_found": (404, CHECK_NOT_FOUND),
@@ -141,6 +146,10 @@ def _strip_non_blank(value: str) -> str:
     if not stripped:
         raise ValueError("must not be blank")
     return stripped
+
+
+def _strip_optional(value: str | None) -> str | None:
+    return None if value is None else _strip_non_blank(value)
 
 
 class ConsentIn(BaseModel):
@@ -199,9 +208,10 @@ class _CheckBody(BaseModel):
     def _mobile(cls, value: str) -> str:
         return normalize_mobile(value)
 
-    @field_validator("name")
+    @field_validator("name", "lc_id", "lead_id")
     @classmethod
-    def _name(cls, value: str) -> str:
+    def _stripped(cls, value: str) -> str:
+        # Identifiers key the quota bucket, the PAN-correction rule and attach: " lc-1" must be "lc-1", "   " nothing.
         return _strip_non_blank(value)
 
 
@@ -210,6 +220,11 @@ class QuickCheckRequest(_CheckBody):
 
     opportunity_id: str | None = Field(default=None, min_length=1, max_length=64)
     monthly_income: _Income | None = None
+
+    @field_validator("opportunity_id")
+    @classmethod
+    def _opportunity(cls, value: str | None) -> str | None:
+        return _strip_optional(value)
 
 
 class FullCheckRequest(_CheckBody):
@@ -220,6 +235,11 @@ class FullCheckRequest(_CheckBody):
     monthly_income: _Income
     acknowledge_ntc_warning: StrictBool = False
     refresh: StrictBool = False
+
+    @field_validator("opportunity_id")
+    @classmethod
+    def _opportunity(cls, value: str) -> str:
+        return _strip_non_blank(value)
 
 
 class RecomputeRequest(BaseModel):
@@ -235,6 +255,11 @@ class AttachRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     contact_id: str = Field(min_length=1, max_length=64)
+
+    @field_validator("contact_id")
+    @classmethod
+    def _contact(cls, value: str) -> str:
+        return _strip_non_blank(value)
 
 
 class AttachResponse(BaseModel):
@@ -297,6 +322,12 @@ def harden_tracing_env(environ: MutableMapping[str, str]) -> None:
     environ.update(TRACE_HIDE_ENV)
 
 
+def _forget_langsmith_env_reads() -> None:
+    """langsmith memoises its env reads (``utils.get_env_var`` is lru_cached), so a read made before ``create_app`` would
+    keep the old HIDE / TRACING values for the life of the process. Clearing makes the hardened env take effect."""
+    getattr(ls_utils, "get_env_var").cache_clear()
+
+
 def _tracing_wanted(settings: Settings) -> bool:
     """Our flag, OR langsmith's own env switches (LANGCHAIN_TRACING_V2 & co.): whenever langchain would trace, it traces
     through our payload-free tracer instead of adding its default one."""
@@ -353,6 +384,7 @@ def create_app(
     if not settings.auth_enabled:
         logger.warning("SERVICE_API_TOKEN unset: API auth DISABLED (dev mode only)")
     harden_tracing_env(os.environ)
+    _forget_langsmith_env_reads()
 
     repo_ = repo if repo is not None else _make_repo(settings)
     owned_surepass: LiveSurePassClient | None = None
@@ -413,10 +445,18 @@ async def _validation_error_handler(request: Request, exc: Exception) -> JSONRes
     """``loc`` / ``msg`` / ``type`` only: FastAPI's default body echoes ``input`` (and ``ctx``), i.e. the PAN."""
     errors: list[Any] = list(exc.errors()) if isinstance(exc, RequestValidationError) else []
     detail = [
-        {"loc": list(error.get("loc", ())), "msg": str(error.get("msg", "")), "type": str(error.get("type", ""))}
+        {"loc": _safe_loc(error), "msg": str(error.get("msg", "")), "type": str(error.get("type", ""))}
         for error in cast("list[Mapping[str, Any]]", errors)
     ]
     return JSONResponse(status_code=422, content={"detail": detail})
+
+
+def _safe_loc(error: Mapping[str, Any]) -> list[Any]:
+    """The error's ``loc``, with an unknown key's NAME (caller-chosen, possibly PAN-shaped) masked."""
+    loc = list(cast("tuple[Any, ...]", error.get("loc", ())))
+    if error.get("type") == "extra_forbidden" and loc:
+        loc[-1] = EXTRA_FIELD_LOC
+    return loc
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -457,12 +497,44 @@ class _Outcome:
     error: Exception | None = None
 
 
-def _call_graph(graph: GraphInvoker, state: CheckState, config: RunnableConfig) -> _Outcome:
-    # A graph exception is boxed, so a TimeoutError raised INSIDE the graph is never mistaken for the route budget.
-    try:
-        return _Outcome(final=graph(state, config))
-    except Exception as exc:
-        return _Outcome(error=exc)
+class _GraphRun:
+    """One graph invocation shared between the route and its threadpool worker.
+
+    ``call`` (worker) boxes a graph exception, so a TimeoutError raised INSIDE the graph is never mistaken for the route
+    budget. ``abandon`` (route, on its timeout) marks the run as orphaned. An exception that ends an abandoned run reaches
+    no one, so it is logged here, exactly once whichever side finishes first, as ``check_id`` + exception TYPE only (the
+    message could carry PII)."""
+
+    def __init__(self, *, check_id: str) -> None:
+        self._check_id = check_id
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._outcome: _Outcome | None = None
+
+    def call(self, graph: GraphInvoker, state: CheckState, config: RunnableConfig) -> _Outcome:
+        try:
+            outcome = _Outcome(final=graph(state, config))
+        except Exception as exc:
+            outcome = _Outcome(error=exc)
+        with self._lock:
+            self._outcome = outcome
+            abandoned = self._abandoned
+        if abandoned:
+            self._log_orphaned(outcome)
+        return outcome
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+            outcome = self._outcome  # set only when the worker already finished (wait_for raced a ready result)
+        if outcome is not None:
+            self._log_orphaned(outcome)
+
+    def _log_orphaned(self, outcome: _Outcome) -> None:
+        if outcome.error is not None:
+            logger.error(
+                "graph raised after its route timed out check_id=%s (%s)", self._check_id, type(outcome.error).__name__
+            )
 
 
 def _view_of(final: Mapping[str, Any] | None, check_id: str) -> LcView:
@@ -508,11 +580,13 @@ def _record_route_timeout(repo: Repo, ctx: _RunContext) -> None:
 async def _run_graph(
     runtime: AppRuntime, graph: GraphInvoker, state: CheckState, config: RunnableConfig, ctx: _RunContext
 ) -> LcView:
+    run = _GraphRun(check_id=ctx.check_id)
     try:
         outcome = await asyncio.wait_for(
-            run_in_threadpool(_call_graph, graph, state, config), timeout=runtime.settings.graph_timeout_seconds
+            run_in_threadpool(run.call, graph, state, config), timeout=runtime.settings.graph_timeout_seconds
         )
     except TimeoutError:
+        run.abandon()
         logger.error("check timed out check_id=%s kind=%s pan_hash=%s", ctx.check_id, ctx.kind, ctx.pan_hash)
         await run_in_threadpool(_record_route_timeout, runtime.deps.repo, ctx)
         return build_error_lc_view(check_id=ctx.check_id, kind=ctx.kind)

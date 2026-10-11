@@ -400,6 +400,17 @@ def test_create_app_hardens_the_langsmith_env_against_payload_export() -> None:
     assert env == {"LANGSMITH_HIDE_INPUTS": "true", "LANGSMITH_HIDE_OUTPUTS": "true"}
 
 
+def test_create_app_clears_langsmiths_memoised_env_reads_so_the_hide_switch_takes_effect() -> None:
+    # langsmith's get_env_var is lru_cached: a read made BEFORE create_app (here: env unset -> None) would otherwise keep
+    # the stale value for the life of the process. No cache_clear in this test between the read and the assertions.
+    read_env = getattr(ls_utils, "get_env_var")
+    assert (read_env("HIDE_INPUTS"), read_env("HIDE_OUTPUTS")) == (None, None)
+    main.create_app(api_settings())
+    assert (read_env("HIDE_INPUTS"), read_env("HIDE_OUTPUTS")) == ("true", "true")
+    default_client = Client(api_key="k", api_url="http://langsmith.invalid", auto_batch_tracing=False)
+    assert (getattr(default_client, "_hide_inputs"), getattr(default_client, "_hide_outputs")) == (True, True)
+
+
 # =========================================================================== auth (K21)
 
 _ROUTES: Final[list[tuple[str, dict[str, Any]]]] = [
@@ -682,6 +693,65 @@ def test_422_bodies_carry_loc_msg_type_only_and_never_echo_the_request() -> None
     assert api.nothing_recorded()
 
 
+def test_an_unknown_key_is_never_echoed_even_through_the_error_loc() -> None:
+    # A caller-chosen KEY shaped like a PAN would otherwise come back verbatim as the last ``loc`` segment.
+    api = make_api()
+    key = "ZZZPE9999Q"
+    with client_of(api.app) as client:
+        top = client.post("/checks/quick", json={**quick_payload(), key: 1})
+        nested = client.post("/checks/quick", json=quick_payload(consent=consent_obj(**{key: True})))
+        attach = client.post(f"/checks/{UNKNOWN_ID}/attach", json={"contact_id": "c_1", key: "x"})
+    for response, loc in (
+        (top, ["body", main.EXTRA_FIELD_LOC]),
+        (nested, ["body", "consent", main.EXTRA_FIELD_LOC]),
+        (attach, ["body", main.EXTRA_FIELD_LOC]),
+    ):
+        assert response.status_code == 422
+        assert key not in response.text
+        assert response.json()["detail"] == [
+            {"loc": loc, "msg": "Extra inputs are not permitted", "type": "extra_forbidden"}
+        ]
+    assert api.nothing_recorded()
+
+
+_BLANK_ID_CASES: Final[dict[str, tuple[str, Mutation]]] = {
+    "blank_lc_id": ("quick", lambda p: {**p, "lc_id": "   "}),
+    "blank_lead_id": ("quick", lambda p: {**p, "lead_id": "\t"}),
+    "blank_quick_opp": ("quick", lambda p: {**p, "opportunity_id": "  "}),
+    "blank_full_opp": ("full", lambda p: {**p, "opportunity_id": " "}),
+    "blank_full_lc_id": ("full", lambda p: {**p, "lc_id": "  "}),
+}
+
+
+@pytest.mark.parametrize(("kind", "mutate"), list(_BLANK_ID_CASES.values()), ids=list(_BLANK_ID_CASES))
+def test_whitespace_only_identifiers_are_422(kind: str, mutate: Mutation) -> None:
+    api = make_api(happy_quick if kind == "quick" else happy_full)
+    with client_of(api.app) as client:
+        resp = client.post(f"/checks/{kind}", json=mutate(quick_payload() if kind == "quick" else full_payload()))
+    assert resp.status_code == 422
+    assert api.nothing_recorded()
+
+
+def test_padded_identifiers_are_stripped_so_a_padded_lc_id_shares_its_twins_quota_bucket() -> None:
+    api = make_api()
+    with client_of(api.app) as client:
+        body = quick_route_ok(api, client, lc_id=f" {LC_ID} ", lead_id=f"{LEAD}\t", opportunity_id=" opp-pad-1 ")
+    row = api.row(body["check_id"])
+    assert (row.lc_id, row.lead_id, row.opportunity_id) == (LC_ID, LEAD, "opp-pad-1")
+    [consent] = api.repo.list_consents()
+    assert (consent.lc_id, consent.lead_id, consent.opportunity_id) == (LC_ID, LEAD, "opp-pad-1")
+    assert row.counted_against_quota is True
+    assert api.repo.quick_checks_used_today(LC_ID) == 1  # the SAME bucket as the unpadded id
+    assert body["quick_checks_left_today"] == 4
+
+
+def test_a_padded_full_opportunity_id_is_stored_stripped() -> None:
+    api = make_api(happy_full)
+    with client_of(api.app) as client:
+        body = client.post("/checks/full", json=full_payload(opportunity_id=f"  {OPP} ")).json()
+    assert api.row(body["check_id"]).opportunity_id == OPP
+
+
 # =========================================================================== full checks + stage gate (K19)
 
 
@@ -872,6 +942,71 @@ def test_a_route_timeout_records_the_error_row_directly_and_leaves_the_in_flight
             assert api.row(check_id).status == "error"  # persist's terminal update was a guarded no-op
     finally:
         release.set()
+
+
+def test_a_graph_that_raises_after_its_route_timed_out_logs_the_exception_type_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    release = threading.Event()
+
+    def late_raise(state: CheckState, config: RunnableConfig) -> Mapping[str, Any]:
+        release.wait(10)
+        raise RuntimeError(f"late failure for {PAN_OK} / {MOBILE}")
+
+    api = make_api(GRAPH_TIMEOUT_SECONDS=0.2)
+    api.runtime.graphs["quick"] = late_raise
+    try:
+        with caplog.at_level(logging.WARNING, logger="eligibility_agent"), client_of(api.app) as client:
+            body = quick_route_ok(api, client)
+            check_id = body["check_id"]
+            assert body == build_error_lc_view(check_id=check_id, kind="quick").model_dump(mode="json")
+            assert not [r for r in caplog.records if "after its route timed out" in r.getMessage()]
+            release.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not [
+                r for r in caplog.records if "after its route timed out" in r.getMessage()
+            ]:
+                time.sleep(0.01)
+    finally:
+        release.set()
+    [record] = [r for r in caplog.records if "after its route timed out" in r.getMessage()]
+    text = record.getMessage()
+    assert check_id in text and "RuntimeError" in text
+    assert PAN_OK not in caplog.text and MOBILE not in caplog.text and "late failure" not in caplog.text
+
+
+def _raising_graph(state: CheckState, config: RunnableConfig) -> Mapping[str, Any]:
+    raise ValueError(f"boom {PAN_OK}")
+
+
+def _ok_graph(state: CheckState, config: RunnableConfig) -> Mapping[str, Any]:
+    return {"lc_view": None}
+
+
+def test_the_late_failure_is_logged_exactly_once_whichever_side_finishes_first(caplog: pytest.LogCaptureFixture) -> None:
+    state: CheckState = {"check_id": "chk-late"}
+    config: RunnableConfig = {}
+    with caplog.at_level(logging.WARNING, logger="eligibility_agent"):
+        # Graph finished first (the wait_for cancel raced a ready result): the route's abandon() logs it.
+        early = main._GraphRun(check_id="chk-race")
+        outcome = early.call(_raising_graph, state, config)
+        assert isinstance(outcome.error, ValueError)
+        assert not caplog.records
+        early.abandon()
+        # Route abandoned first: the graph thread logs it when it finishes.
+        late = main._GraphRun(check_id="chk-late")
+        late.abandon()
+        late.call(_raising_graph, state, config)
+        # A late SUCCESS and a run that was never abandoned log nothing.
+        quiet = main._GraphRun(check_id="chk-ok")
+        quiet.abandon()
+        quiet.call(_ok_graph, state, config)
+        main._GraphRun(check_id="chk-normal").call(_raising_graph, state, config)
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 2
+    assert "chk-race" in messages[0] and "ValueError" in messages[0]
+    assert "chk-late" in messages[1] and "ValueError" in messages[1]
+    assert PAN_OK not in caplog.text and "boom" not in caplog.text
 
 
 # =========================================================================== runnable config + tracing (K21 / T11)
@@ -1177,7 +1312,12 @@ def test_attach_matrix() -> None:
     assert api.row(full_id).contact_id is None
 
 
-@pytest.mark.parametrize("body", [{}, {"contact_id": ""}, {"contact_id": "x" * 65}, {"contact_id": "c", "x": 1}, {"contact_id": 5}])
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"contact_id": ""}, {"contact_id": "   "}, {"contact_id": "\t"}, {"contact_id": "x" * 65},
+     {"contact_id": "c", "x": 1}, {"contact_id": 5}],
+    ids=["empty_body", "empty", "spaces", "tab", "too_long", "extra_key", "not_a_string"],
+)
 def test_attach_body_validation(body: dict[str, Any]) -> None:
     api = make_api()
     with client_of(api.app) as client:
@@ -1185,6 +1325,18 @@ def test_attach_body_validation(body: dict[str, Any]) -> None:
         resp = client.post(f"/checks/{check_id}/attach", json=body)
     assert resp.status_code == 422
     assert api.row(check_id).contact_id is None
+
+
+def test_a_padded_contact_id_is_stripped_and_stays_idempotent_with_its_twin() -> None:
+    api = make_api()
+    with client_of(api.app) as client:
+        check_id = quick_route_ok(api, client)["check_id"]
+        padded = client.post(f"/checks/{check_id}/attach", json={"contact_id": " c_1 "})
+        twin = client.post(f"/checks/{check_id}/attach", json={"contact_id": "c_1"})
+    expected = {"check_id": check_id, "contact_id": "c_1", "attached": True}
+    assert (padded.status_code, padded.json()) == (200, expected)
+    assert (twin.status_code, twin.json()) == (200, expected)  # same contact, not a 409 conflict
+    assert api.row(check_id).contact_id == "c_1"
 
 
 # =========================================================================== typing seams
