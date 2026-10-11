@@ -26,6 +26,7 @@ from tests.helpers import (
     OMIT,
     PAN_FULL_NAME,
     PAN_OK,
+    PROBE_LITERALS,
     T0,
     Api,
     ApiFactory,
@@ -243,3 +244,9 @@ def test_leak_scanner_catches_plants_and_skips_only_the_id_fields() -> None:
         "top_lender.conditions.0: identity literal",
         "alternates.0.name: identity literal",
     }
+
+
+@pytest.mark.parametrize("literal", PROBE_LITERALS)
+def test_leak_scanner_flags_every_real_probe_literal(literal: str) -> None:
+    """The probe files' literals are forbidden in every view (the harness scans each one it returns)."""
+    assert leak_findings({"check_id": "x", "label": f"ref {literal}x"}) == ["label: identity literal"]

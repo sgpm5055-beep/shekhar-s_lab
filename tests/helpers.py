@@ -76,6 +76,8 @@ AUTH: Final[dict[str, str]] = {"Authorization": f"Bearer {TOKEN}"}
 
 PAN_OK: Final[str] = scenarios.PAN_OK  # "ABCPE1234F": person, valid, zip 560001
 PAN_TWO: Final[str] = "FGHPJ5678K"
+PAN_THREE: Final[str] = "QRSPT2468M"  # PAN-correction and manager-change vectors need more valid person PANs
+PAN_FOUR: Final[str] = "UVWPX1357N"
 PAN_NTC: Final[str] = scenarios.PAN_NTC  # "KLMPN4321Q"
 PAN_COMPANY: Final[str] = scenarios.PAN_COMPANY  # "AAACA9999Z"
 PAN_INVALID: Final[str] = scenarios.PAN_INVALID  # "ZZZPZ0000Z"
@@ -94,6 +96,8 @@ OPP_TWO: Final[str] = "opp-2"
 IDENTITY_LITERALS: Final[tuple[str, ...]] = (
     PAN_OK,
     PAN_TWO,
+    PAN_THREE,
+    PAN_FOUR,
     PAN_NTC,
     PAN_COMPANY,
     PAN_INVALID,
@@ -107,6 +111,10 @@ IDENTITY_LITERALS: Final[tuple[str, ...]] = (
     "110001",
     "400001",
 )
+# The real probe files' literals (the envelope builders' probe-literal guard, test_envelope_builders): synthetic worlds
+# never carry them, so one in a view would mean real data leaked into the suite.
+PROBE_LITERALS: Final[tuple[str, ...]] = ("791111", "201301", "560071", "16559", "2434004", "138696", "109433")
+FORBIDDEN_LITERALS: Final[tuple[str, ...]] = IDENTITY_LITERALS + PROBE_LITERALS
 
 
 def pan_hash_of(pan: str) -> str:
@@ -425,8 +433,12 @@ class Api:
         return self._ok(self.post_full(full_payload(**over)))
 
     def _ok(self, response: Response) -> dict[str, Any]:
+        """HTTP 200, and the view passes ``assert_no_leak``: every view the harness hands back is scanned, so leak
+        hygiene holds on every check of every scenario, not only where a test remembers to call the scanner."""
         assert response.status_code == 200, response.text
-        return cast("dict[str, Any]", response.json())
+        body = cast("dict[str, Any]", response.json())
+        assert_no_leak(body)
+        return body
 
     # ---- observations
 
@@ -632,15 +644,16 @@ LLM_AUTHORED_FIELDS: Final[frozenset[str]] = frozenset({"rationale", "conditions
 _LENDER_FIELDS: Final[frozenset[str]] = frozenset({"top_lender", "alternates"})
 
 
-def _string_leaves(node: object, path: tuple[str | int, ...] = ()) -> Iterator[tuple[tuple[str | int, ...], str]]:
+def string_leaves(node: object, path: tuple[str | int, ...] = ()) -> Iterator[tuple[tuple[str | int, ...], str]]:
+    """Every string leaf of a JSON-shaped value with its path (mapping keys and list indexes)."""
     if isinstance(node, str):
         yield path, node
     elif isinstance(node, Mapping):
         for key, value in cast("Mapping[str, object]", node).items():
-            yield from _string_leaves(value, (*path, key))
+            yield from string_leaves(value, (*path, key))
     elif isinstance(node, Sequence):
         for index, value in enumerate(cast("Sequence[object]", node)):
-            yield from _string_leaves(value, (*path, index))
+            yield from string_leaves(value, (*path, index))
 
 
 def _exempt(path: tuple[str | int, ...]) -> bool:
@@ -650,11 +663,11 @@ def _exempt(path: tuple[str | int, ...]) -> bool:
     return bool(path) and path[-1] == "id" and path[0] in _LENDER_FIELDS
 
 
-def leak_findings(body: Mapping[str, Any], *, forbidden: Sequence[str] = IDENTITY_LITERALS) -> list[str]:
+def leak_findings(body: Mapping[str, Any], *, forbidden: Sequence[str] = FORBIDDEN_LITERALS) -> list[str]:
     """Every offending string leaf, as ``'<dotted path>: <reason>'``. Empty means clean."""
     findings: list[str] = []
     lowered = [literal.casefold() for literal in forbidden]
-    for path, text in _string_leaves(body):
+    for path, text in string_leaves(body):
         if _exempt(path):
             continue
         dotted = ".".join(str(p) for p in path)

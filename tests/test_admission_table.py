@@ -1092,6 +1092,29 @@ def _events(*specs: tuple[str, str]) -> list[Any]:
         pytest.param(
             _events(("initial", PAN_A), ("correction", PAN_B)), True, PAN_B, "same_pan", id="same-pan-after-correction"
         ),
+        # T7 deferred vectors: a manager_change as the LATEST event never gives a spent correction back (kills a
+        # policy that reads only the latest event's kind), and the manager-approved PAN is the current one.
+        pytest.param(
+            _events(("initial", PAN_A), ("correction", PAN_B), ("manager_change", "c" * 64)),
+            False,
+            "d" * 64,
+            "needs_manager",
+            id="manager-change-latest-correction-still-spent",
+        ),
+        pytest.param(
+            _events(("initial", PAN_A), ("correction", PAN_B), ("manager_change", "c" * 64)),
+            False,
+            "c" * 64,
+            "same_pan",
+            id="manager-approved-pan-is-current",
+        ),
+        pytest.param(
+            _events(("initial", PAN_A), ("manager_change", PAN_B)),
+            True,
+            "c" * 64,
+            "needs_manager",
+            id="manager-change-then-report-exists",
+        ),
     ],
 )
 def test_evaluate_pan_change_table(events: list[Any], report_exists: bool, request_pan: str, expected: str) -> None:
