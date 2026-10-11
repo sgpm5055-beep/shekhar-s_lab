@@ -221,6 +221,7 @@ dev = [
     { name = "pyright", extra = ["nodejs"] },
     { name = "pytest" },
     { name = "pytest-socket" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -246,6 +247,7 @@ dev = [
     { name = "pyright", extras = ["nodejs"], specifier = ">=1.1.405,<1.2" },
     { name = "pytest", specifier = ">=9.1,<10" },
     { name = "pytest-socket", specifier = ">=0.8.1,<0.9" },
+    { name = "pyyaml", specifier = ">=6,<7" },
 ]
 
 [[package]]

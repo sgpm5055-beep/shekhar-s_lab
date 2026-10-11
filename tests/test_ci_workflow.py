@@ -8,6 +8,7 @@ project rules.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -80,12 +81,25 @@ def test_every_job_sets_up_uv_on_the_pinned_python_before_it_runs_uv(job: str) -
             assert re.search(r"@v\d+\.\d+\.\d+$", str(step["uses"])), f"unpinned action {step['uses']}"
 
 
-def test_every_uv_command_is_frozen_so_a_stale_lockfile_fails_the_build() -> None:
+def test_every_sync_is_locked_so_a_stale_lockfile_fails_the_build() -> None:
+    """`uv sync --frozen` installs whatever uv.lock says WITHOUT checking it against pyproject.toml; only `--locked` fails
+    when the lockfile is stale. Run steps stay `--frozen` (never re-resolve)."""
+    syncs = 0
     for job in _jobs():
         for run in _runs(job):
-            for line in re.findall(r"uv (?:sync|run)\b[^\n]*", run):
+            for line in re.findall(r"uv sync\b[^\n]*", run):
+                syncs += 1
+                assert "--locked" in line and "--frozen" not in line, line
+                assert "--all-groups" in line, line  # dev tools (pyright, pytest, pyyaml) come from the dev group
+            for line in re.findall(r"uv run\b[^\n]*", run):
                 assert "--frozen" in line, line
-    assert all("--all-groups" in line for line in _runs("test")[:1])  # dev tools (pyright, pytest) come from the dev group
+    assert syncs == 3  # one install per job
+
+
+def test_the_workflow_parser_is_a_declared_dev_dependency() -> None:
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dev = cast("list[str]", pyproject["dependency-groups"]["dev"])
+    assert any(re.match(r"pyyaml\b", requirement, re.IGNORECASE) for requirement in dev)
 
 
 def test_test_job_runs_pyright_then_pytest_and_nothing_secret() -> None:
@@ -106,6 +120,9 @@ def test_local_evals_run_the_local_fake_command_and_use_no_secrets() -> None:
 def test_langsmith_job_is_informational_and_secrets_gated() -> None:
     job = _jobs()["evals-langsmith"]
     assert job["continue-on-error"] is True
+    # never on a pull_request: the job holds secrets and runs code the PR controls
+    assert job["if"] == "github.event_name != 'pull_request'"
+    assert not [name for name in ("test", "evals-local") if "if" in _jobs()[name]]  # the blocking jobs always run
     steps = _steps("evals-langsmith")
     gate_index = next(i for i, s in enumerate(steps) if s.get("id") == "gate")
     assert "secrets.LANGSMITH_API_KEY" in str(steps[gate_index]["env"])

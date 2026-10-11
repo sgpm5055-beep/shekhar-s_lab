@@ -24,6 +24,7 @@ dev = [
     "pytest>=9.1,<10",
     "pytest-socket>=0.8.1,<0.9",
     "pyright[nodejs]>=1.1.405,<1.2",
+    "pyyaml>=6,<7",  # tests/test_ci_workflow.py parses the workflow file
 ]
 
 [build-system]

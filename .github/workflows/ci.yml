@@ -5,10 +5,12 @@ name: ci
 #   test             pyright (strict) + pytest. Needs no secrets. pytest-socket blocks every TCP/UDP connection in-process.
 #   evals-local      the golden datasets against the fake model and fake SurePass. Needs no secrets. Fails on a non-zero
 #                    exit (an evaluator failed or a golden crashed).
-#   evals-langsmith  INFORMATIONAL. Runs only when the LANGSMITH_API_KEY secret exists (it is absent on forked PRs and
-#                    until someone configures it): without it the job still goes green with every step after the gate
-#                    skipped. The runner exits 0 whatever the scores are, and the job is continue-on-error, so it can
-#                    never block a merge; read the experiment in LangSmith. It evaluates the datasets that already exist
+#   evals-langsmith  INFORMATIONAL. Never runs on pull_request events: it holds secrets and executes code and workflow
+#                    text a PR can edit, so it runs only on pushes to main and manual dispatches. Even then it proceeds
+#                    only when the LANGSMITH_API_KEY secret exists (until someone configures it): without it the job
+#                    still goes green with every step after the gate skipped. The runner exits 0 whatever the scores
+#                    are, and the job is continue-on-error, so it can never block a merge; read the experiment in
+#                    LangSmith. It evaluates the datasets that already exist
 #                    in LangSmith; it does NOT upload them on every run, because the upload's upsert behaviour is still
 #                    unverified against the live service. Upload them with a manual "Run workflow" and the
 #                    build_datasets box ticked (do it twice the first time and check the example count does not double).
@@ -19,7 +21,9 @@ name: ci
 # The evals import tests/helpers, which is not part of the installed wheel, so every job runs from the repository root
 # (the checkout directory, the default working directory). Do not add a `working-directory` to the eval steps.
 #
-# Actions are pinned to exact release tags; `uv sync --frozen` fails when uv.lock is out of step with pyproject.toml.
+# Actions are pinned to exact release tags. `uv sync --locked` fails when uv.lock is out of step with pyproject.toml
+# (`--frozen` would not: it installs whatever the lockfile says without checking); the run steps use `uv run --frozen`
+# so they never re-resolve.
 
 on:
   push:
@@ -56,8 +60,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Install (locked, all dependency groups)
-        run: uv sync --frozen --all-groups
+      - name: Install (--locked, all dependency groups)
+        run: uv sync --locked --all-groups
       - name: pyright (strict)
         run: uv run --frozen pyright
       - name: pytest (no network)
@@ -79,8 +83,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Install (locked, all dependency groups)
-        run: uv sync --frozen --all-groups
+      - name: Install (--locked, all dependency groups)
+        run: uv sync --locked --all-groups
       - name: Golden datasets, fake model (non-zero exit fails the job)
         run: uv run --frozen python -m eligibility_agent.evals.run --mode local --llm fake --dataset both
 
@@ -89,6 +93,8 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Not on pull_request: the secrets would be exposed to code the PR controls.
+    if: github.event_name != 'pull_request'
     # Informational: an outage at LangSmith or OpenAI must not block a merge.
     continue-on-error: true
     steps:
@@ -106,7 +112,7 @@ jobs:
         run: |
           if [ -z "$LANGSMITH_API_KEY" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::LANGSMITH_API_KEY is not available (forked PR, or the secret is not configured): skipping the LangSmith evals"
+            echo "::notice::LANGSMITH_API_KEY is not available (the secret is not configured): skipping the LangSmith evals"
             exit 0
           fi
           echo "run=true" >> "$GITHUB_OUTPUT"
@@ -121,9 +127,9 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Install (locked, all dependency groups)
+      - name: Install (--locked, all dependency groups)
         if: steps.gate.outputs.run == 'true'
-        run: uv sync --frozen --all-groups
+        run: uv sync --locked --all-groups
       - name: LangSmith experiment (exits 0 whatever the scores are)
         if: steps.gate.outputs.run == 'true'
         env:
