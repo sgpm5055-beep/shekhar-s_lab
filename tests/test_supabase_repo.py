@@ -394,6 +394,13 @@ def test_pan_events_ordered_ascending_and_report_exists() -> None:
     assert repo.report_exists_for_opportunity("opp-1") is True
     assert repo.report_exists_for_opportunity("opp-2") is False
 
+    # service_failure counts only with OPENAI_FAILURE (the report was pulled; the ranking failed afterwards)
+    failed = {"kind": "full", "status": "service_failure", "opportunity_id": "opp-2"}
+    repo.insert_check(make_check(id="d", code="SUREPASS_FAILURE", **failed))
+    assert repo.report_exists_for_opportunity("opp-2") is False
+    repo.insert_check(make_check(id="e", code="OPENAI_FAILURE", **failed))
+    assert repo.report_exists_for_opportunity("opp-2") is True
+
 
 # --------------------------------------------------------------------------- lenders
 

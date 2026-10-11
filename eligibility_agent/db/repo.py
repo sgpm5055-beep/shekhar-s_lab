@@ -293,6 +293,23 @@ class LenderRow:
 # --------------------------------------------------------------------------- audit-sink helpers
 
 
+REPORT_ON_RECORD_STATUSES: Final[tuple[CheckStatus, ...]] = ("ok", "pending_verification", "service_failure")
+
+
+def report_check_on_record(status: str | None, code: str | None) -> bool:
+    """Whether a FULL check with this terminal ``(status, code)`` means a report exists for its opportunity (PRD 5.13).
+
+    ``ok`` (a fresh pull or a report-reuse hit, band reads included); ``pending_verification`` (a timed-out pull: spend
+    unknown, so the report may exist); and ``service_failure`` + ``OPENAI_FAILURE``: the report WAS pulled and billed, only
+    the ranking failed afterwards (the same facts K9 lets a recompute re-derive). Every other failure, a refusal, an
+    unverified PAN, a running row and an ``error`` row is not. RESIDUAL: an ``error`` row written after a report pull
+    (e.g. a persist failure) does not count; the surepass_calls log keeps that spend.
+    """
+    if status == "service_failure":
+        return code == "OPENAI_FAILURE"
+    return status in ("ok", "pending_verification")
+
+
 def call_is_billable(http_status: int | None, success: bool | None, error_kind: ErrorKind | None) -> bool:
     """(HTTP 200 and success:true) or a timeout (spend unknown, so conservatively billable)."""
     return (http_status == 200 and success is True) or error_kind == "timeout"
@@ -457,7 +474,7 @@ class Repo(Protocol):
 
     def insert_pan_event(self, row: OpportunityPanEvent) -> None: ...
 
-    def report_exists_for_opportunity(self, opportunity_id: str) -> bool: ...
+    def report_exists_for_opportunity(self, opportunity_id: str) -> bool: ...  # see report_check_on_record
 
     # ---- SurePass audit sink (the client calls this once per HTTP attempt)
     def log_surepass_call(
@@ -695,7 +712,7 @@ class MemoryRepo:
 
     def report_exists_for_opportunity(self, opportunity_id: str) -> bool:
         return any(
-            c.opportunity_id == opportunity_id and c.kind == "full" and c.status in ("ok", "pending_verification")
+            c.opportunity_id == opportunity_id and c.kind == "full" and report_check_on_record(c.status, c.code)
             for c in self._checks.values()
         )
 
@@ -1159,16 +1176,16 @@ class SupabaseRepo:
         self._insert("opportunity_pan_events", row)
 
     def report_exists_for_opportunity(self, opportunity_id: str) -> bool:
+        # One opportunity holds a handful of full checks: fetch the candidate statuses, apply the shared predicate here.
         response = (
             self._client.table("checks")
-            .select("id")
+            .select("status,code")
             .eq("opportunity_id", opportunity_id)
             .eq("kind", "full")
-            .in_("status", ["ok", "pending_verification"])
-            .limit(1)
+            .in_("status", list(REPORT_ON_RECORD_STATUSES))
             .execute()
         )
-        return bool(_rows(response))
+        return any(report_check_on_record(row.get("status"), row.get("code")) for row in _rows(response))
 
     # ---- audit sink
 

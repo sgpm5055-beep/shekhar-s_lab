@@ -472,7 +472,9 @@ def evaluate_pan_change(
 
     'Latest' is by created_at (ties keep list order), so the order the repo returns events in is not relied on.
     report_exists is an ASSUMPTION: any full check on this opportunity with status in ('ok',
-    'pending_verification') ('pending_verification' counts: unknown spend means a report may exist).
+    'pending_verification') ('pending_verification' counts: unknown spend means a report may exist), or
+    'service_failure' + 'OPENAI_FAILURE' (the report was pulled and billed; only the ranking failed). The predicate's
+    single home is ``db.repo.report_check_on_record``.
     """
     if not events:
         return "first_pan"

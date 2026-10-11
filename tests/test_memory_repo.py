@@ -999,6 +999,9 @@ def test_pan_events_are_per_opportunity_and_created_at_ascending() -> None:
         ("full", "pending_verification", None, True),  # spend/report existence unknown
         ("full", "refused", "PAN_LOCKED", False),
         ("full", "service_failure", "SUREPASS_FAILURE", False),
+        ("full", "service_failure", "OPENAI_FAILURE", True),  # the report was pulled; only the ranking failed
+        ("full", "ok", "NO_PINCODE_ON_PAN", True),  # a band read still pulled the report
+        ("quick", "service_failure", "OPENAI_FAILURE", False),
         ("full", "running", None, False),
         ("full", "error", None, False),
         ("full", "pan_not_verified", None, False),
