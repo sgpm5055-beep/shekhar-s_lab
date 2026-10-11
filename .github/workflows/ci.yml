@@ -1,0 +1,139 @@
+name: ci
+
+# Three jobs, none of which can spend SurePass credits or reach a SurePass endpoint:
+#
+#   test             pyright (strict) + pytest. Needs no secrets. pytest-socket blocks every TCP/UDP connection in-process.
+#   evals-local      the golden datasets against the fake model and fake SurePass. Needs no secrets. Fails on a non-zero
+#                    exit (an evaluator failed or a golden crashed).
+#   evals-langsmith  INFORMATIONAL. Runs only when the LANGSMITH_API_KEY secret exists (it is absent on forked PRs and
+#                    until someone configures it): without it the job still goes green with every step after the gate
+#                    skipped. The runner exits 0 whatever the scores are, and the job is continue-on-error, so it can
+#                    never block a merge; read the experiment in LangSmith. It evaluates the datasets that already exist
+#                    in LangSmith; it does NOT upload them on every run, because the upload's upsert behaviour is still
+#                    unverified against the live service. Upload them with a manual "Run workflow" and the
+#                    build_datasets box ticked (do it twice the first time and check the example count does not double).
+#
+# The live-call switch for SurePass is never set anywhere in this file (tests/test_ci_workflow.py pins that): the client
+# refuses every outbound SurePass call unless that variable is exactly "true".
+#
+# The evals import tests/helpers, which is not part of the installed wheel, so every job runs from the repository root
+# (the checkout directory, the default working directory). Do not add a `working-directory` to the eval steps.
+#
+# Actions are pinned to exact release tags; `uv sync --frozen` fails when uv.lock is out of step with pyproject.toml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_datasets:
+        description: "evals-langsmith: upload / refresh the golden datasets in LangSmith first (run twice the first time)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pyright + pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Defence in depth: tests/conftest.py already forces tracing off and scrubs every service variable.
+      LANGSMITH_TRACING: "false"
+      LANGCHAIN_TRACING_V2: "false"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (locked, all dependency groups)
+        run: uv sync --frozen --all-groups
+      - name: pyright (strict)
+        run: uv run --frozen pyright
+      - name: pytest (no network)
+        run: uv run --frozen pytest -q
+
+  evals-local:
+    name: evals (local, fake model)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LANGSMITH_TRACING: "false"
+      LANGCHAIN_TRACING_V2: "false"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (locked, all dependency groups)
+        run: uv sync --frozen --all-groups
+      - name: Golden datasets, fake model (non-zero exit fails the job)
+        run: uv run --frozen python -m eligibility_agent.evals.run --mode local --llm fake --dataset both
+
+  evals-langsmith:
+    name: evals (LangSmith, informational)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Informational: an outage at LangSmith or OpenAI must not block a merge.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # Secrets cannot be read in a job-level `if`, so the gate step turns their presence into step outputs. The secrets
+      # are exposed to this gate and to the run step only, never to the install step (which executes dependency build
+      # code).
+      - name: Gate on secrets
+        id: gate
+        env:
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$LANGSMITH_API_KEY" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::LANGSMITH_API_KEY is not available (forked PR, or the secret is not configured): skipping the LangSmith evals"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo "llm=real" >> "$GITHUB_OUTPUT"
+          else
+            echo "llm=fake" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_API_KEY is not available: the LangSmith evals use the fake model"
+          fi
+      - uses: astral-sh/setup-uv@v10.3.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (locked, all dependency groups)
+        if: steps.gate.outputs.run == 'true'
+        run: uv sync --frozen --all-groups
+      - name: LangSmith experiment (exits 0 whatever the scores are)
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_MODE: ${{ steps.gate.outputs.llm }}
+          BUILD_DATASETS: ${{ inputs.build_datasets && 'true' || 'false' }}
+        run: |
+          args=(--mode langsmith --llm "$LLM_MODE" --max-real 20 --dataset both --experiment-prefix "ci-${GITHUB_SHA}")
+          if [ "$BUILD_DATASETS" = "true" ]; then
+            args+=(--build-datasets)
+          fi
+          uv run --frozen python -m eligibility_agent.evals.run "${args[@]}"

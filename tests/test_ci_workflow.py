@@ -1,0 +1,146 @@
+"""Task 16: .github/workflows/ci.yml is internally consistent and keeps the standing CI rules.
+
+A parse-level check (no GitHub needed): the job graph, the uv setup, the secrets gating and the one rule that must never
+regress, no SurePass live switch anywhere in the file. Run actionlint for the expression/shell lint; this file pins the
+project rules.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any, Final, cast
+
+import pytest
+import yaml
+
+REPO_ROOT: Final = Path(__file__).resolve().parents[1]
+WORKFLOW: Final = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+LOCAL_EVALS: Final = "python -m eligibility_agent.evals.run --mode local --llm fake --dataset both"
+
+Doc = dict[str, Any]
+
+
+def _text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def _workflow() -> Doc:
+    return cast(Doc, yaml.safe_load(_text()))
+
+
+def _triggers() -> dict[Any, Any]:
+    raw = cast("dict[Any, Any]", yaml.safe_load(_text()))
+    return cast("dict[Any, Any]", raw.get("on", raw.get(True)))  # YAML 1.1 reads the bare key `on` as True
+
+
+def _jobs() -> dict[str, Doc]:
+    return cast("dict[str, Doc]", _workflow()["jobs"])
+
+
+def _steps(job: str) -> list[Doc]:
+    return cast("list[Doc]", _jobs()[job]["steps"])
+
+
+def _needs(job: str) -> list[str]:
+    needs: Any = _jobs()[job].get("needs", [])
+    return [needs] if isinstance(needs, str) else cast("list[str]", needs)
+
+
+def _runs(job: str) -> list[str]:
+    return [str(step["run"]) for step in _steps(job) if "run" in step]
+
+
+def _uv_index(job: str, predicate: str) -> int:
+    return next(i for i, step in enumerate(_steps(job)) if predicate in str(step.get("run", "")))
+
+
+def test_the_workflow_parses_and_has_the_three_jobs() -> None:
+    assert set(_jobs()) == {"test", "evals-local", "evals-langsmith"}
+    assert {"push", "pull_request", "workflow_dispatch"} <= set(_triggers())
+
+
+def test_job_dependencies_resolve_and_the_evals_wait_for_the_tests() -> None:
+    assert _needs("test") == []
+    for job in ("evals-local", "evals-langsmith"):
+        assert _needs(job) == ["test"]
+        assert set(_needs(job)) <= set(_jobs())
+
+
+@pytest.mark.parametrize("job", ["test", "evals-local", "evals-langsmith"])
+def test_every_job_sets_up_uv_on_the_pinned_python_before_it_runs_uv(job: str) -> None:
+    pinned = (REPO_ROOT / ".python-version").read_text().strip()
+    steps = _steps(job)
+    setup = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("astral-sh/setup-uv@"))
+    checkout = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout < setup < _uv_index(job, "uv sync") < _uv_index(job, "uv run")
+    assert str(cast("Doc", steps[setup]["with"])["python-version"]) == pinned
+    for step in steps:
+        if "uses" in step:
+            assert re.search(r"@v\d+\.\d+\.\d+$", str(step["uses"])), f"unpinned action {step['uses']}"
+
+
+def test_every_uv_command_is_frozen_so_a_stale_lockfile_fails_the_build() -> None:
+    for job in _jobs():
+        for run in _runs(job):
+            for line in re.findall(r"uv (?:sync|run)\b[^\n]*", run):
+                assert "--frozen" in line, line
+    assert all("--all-groups" in line for line in _runs("test")[:1])  # dev tools (pyright, pytest) come from the dev group
+
+
+def test_test_job_runs_pyright_then_pytest_and_nothing_secret() -> None:
+    runs = _runs("test")
+    assert [r for r in runs if "pyright" in r] == ["uv run --frozen pyright"]
+    assert [r for r in runs if "pytest" in r] == ["uv run --frozen pytest -q"]
+    assert runs.index("uv run --frozen pyright") < runs.index("uv run --frozen pytest -q")
+    assert "secrets." not in str(_jobs()["test"])
+
+
+def test_local_evals_run_the_local_fake_command_and_use_no_secrets() -> None:
+    job = _jobs()["evals-local"]
+    assert any(LOCAL_EVALS in run for run in _runs("evals-local"))
+    assert "secrets." not in str(job)
+    assert not job.get("continue-on-error")  # a non-zero exit must fail the job
+
+
+def test_langsmith_job_is_informational_and_secrets_gated() -> None:
+    job = _jobs()["evals-langsmith"]
+    assert job["continue-on-error"] is True
+    steps = _steps("evals-langsmith")
+    gate_index = next(i for i, s in enumerate(steps) if s.get("id") == "gate")
+    assert "secrets.LANGSMITH_API_KEY" in str(steps[gate_index]["env"])
+    for step in steps[gate_index + 1 :]:
+        assert step.get("if") == "steps.gate.outputs.run == 'true'", step  # skipped, never failed, without the secret
+    # the secrets reach exactly the gate and the run step; the install step never sees them
+    with_secrets = [s.get("name") or s.get("uses") for s in steps if "secrets." in str(s)]
+    assert with_secrets == ["Gate on secrets", "LangSmith experiment (exits 0 whatever the scores are)"]
+    run = next(r for r in _runs("evals-langsmith") if "evals.run" in r)
+    assert "--mode langsmith" in run and "--max-real 20" in run
+    # datasets are uploaded only on request (manual dispatch), not on every run: upsert semantics are unverified
+    assert "--build-datasets" in run and 'BUILD_DATASETS" = "true"' in run
+    dispatch = cast("dict[str, Any]", _triggers()["workflow_dispatch"])
+    assert dispatch["inputs"]["build_datasets"]["default"] is False
+
+
+def test_secrets_appear_only_in_the_langsmith_job() -> None:
+    for name, job in _jobs().items():
+        assert ("secrets." in str(job)) == (name == "evals-langsmith"), name
+
+
+def test_the_surepass_live_switch_is_never_set_or_even_referenced_by_a_command() -> None:
+    workflow = _workflow()
+    envs: list[Doc] = [cast(Doc, workflow.get("env") or {})]
+    for job in _jobs().values():
+        envs.append(cast(Doc, job.get("env") or {}))
+        envs.extend(cast(Doc, step.get("env") or {}) for step in cast("list[Doc]", job["steps"]))
+    assert not [name for env in envs for name in env if name.upper().startswith("SUREPASS")]
+    for job in _jobs():
+        assert not any("SUREPASS" in run.upper() for run in _runs(job))
+    uncommented = [line for line in _text().splitlines() if not line.lstrip().startswith("#")]
+    assert not any("SUREPASS" in line.upper() for line in uncommented)
+
+
+def test_the_documented_local_eval_command_is_the_one_ci_runs() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"uv run {LOCAL_EVALS}" in readme
+    assert f"uv run --frozen {LOCAL_EVALS}" in "\n".join(_runs("evals-local"))
