@@ -519,6 +519,25 @@ class PurgeRepo(Protocol):
     def delete_expired_consents(self, now: datetime) -> int: ...  # referencing rows are unlinked (ON DELETE SET NULL)
 
 
+class LenderWriter(Protocol):
+    """What scripts/seed_lenders.py needs. Kept off ``Repo``: the service never writes lenders (the criteria admin page
+    does, against the same tables); this is the bootstrap path for a fresh database."""
+
+    def lender_versions(self, lender_id: str) -> list[tuple[int, bool]]: ...  # (version, published), ascending
+
+    def create_published_lender(
+        self,
+        lender_id: str,
+        version: int,
+        name: str,
+        criteria: dict[str, Any],
+        policy_notes: str,
+        pincodes: Collection[str],
+    ) -> None: ...
+    # one lenders row (published) + its lender_pincodes rows; ValueError on a duplicate (id, version), a second
+    # published version of the same lender, or a malformed pincode. All-or-nothing as far as the backend allows.
+
+
 # --------------------------------------------------------------------------- MemoryRepo
 
 
@@ -527,9 +546,9 @@ class MemoryRepo:
 
     IST-day logic mirrors the SQL functions; lock semantics mirror acquire_pan_lock (steal only when the held
     lock is released or expired); the status/code CHECK, the terminal guard, the one-published-version index
-    and the surepass_calls -> checks FK are enforced. Non-protocol helpers for tests and evals: seed_lender,
-    set_lender_published, set_quota_override, resolve_review, list_checks, list_consents, list_reviews, list_calls,
-    active_locks_snapshot.
+    and the surepass_calls -> checks FK are enforced. Also a ``LenderWriter``. Non-protocol helpers for tests and
+    evals: seed_lender, set_lender_published, set_quota_override, resolve_review, list_checks, list_consents,
+    list_reviews, list_calls, active_locks_snapshot.
     """
 
     def __init__(self, clock: Clock = utc_now, raw_store: MemoryRawStore | None = None) -> None:
@@ -841,6 +860,22 @@ class MemoryRepo:
             ("score_cache", self._score_cache),
             ("report_cache", self._report_cache),
         ]
+
+    # ---- LenderWriter (scripts/seed_lenders.py)
+
+    def lender_versions(self, lender_id: str) -> list[tuple[int, bool]]:
+        return sorted((version, row.published) for (row_id, version), row in self._lenders.items() if row_id == lender_id)
+
+    def create_published_lender(
+        self,
+        lender_id: str,
+        version: int,
+        name: str,
+        criteria: dict[str, Any],
+        policy_notes: str,
+        pincodes: Collection[str],
+    ) -> None:
+        self.seed_lender(lender_id, version, name, True, criteria, policy_notes, pincodes)
 
     # ---- test / eval helpers (not part of the protocol)
 
@@ -1279,6 +1314,66 @@ class SupabaseRepo:
             for r in lenders
             if (r["id"], int(r["version"])) in matched
         ]
+
+    # ---- LenderWriter (scripts/seed_lenders.py)
+
+    def lender_versions(self, lender_id: str) -> list[tuple[int, bool]]:
+        response = (
+            self._client.table("lenders").select("version,published").eq("id", lender_id).order("version").execute()
+        )
+        return [(int(r["version"]), bool(r["published"])) for r in _rows(response)]
+
+    def create_published_lender(
+        self,
+        lender_id: str,
+        version: int,
+        name: str,
+        criteria: dict[str, Any],
+        policy_notes: str,
+        pincodes: Collection[str],
+    ) -> None:
+        """Insert UNPUBLISHED, add the pincodes, then flip ``published``: a failure part-way never leaves a published
+        lender without its pincodes. The half-written draft is deleted again (the pincode rows cascade) so a rerun starts
+        clean; if that delete also fails, the leftover draft is visible (unpublished) and the seed script skips it."""
+        wanted = sorted(set(pincodes))
+        bad = [p for p in wanted if not _PINCODE_RE.fullmatch(p)]
+        if bad:
+            raise ValueError(f"invalid pincode(s) {bad!r}")
+        try:
+            self._client.table("lenders").insert(
+                {
+                    "id": lender_id,
+                    "version": version,
+                    "name": name,
+                    "published": False,
+                    "criteria": copy.deepcopy(criteria),
+                    "policy_notes": policy_notes,
+                    "created_by": "seed_lenders",
+                }
+            ).execute()
+        except Exception as exc:
+            if getattr(exc, "code", None) == "23505":  # unique_violation (primary key)
+                raise ValueError(f"duplicate lender version ({lender_id!r}, {version})") from exc
+            raise
+        try:
+            if wanted:
+                self._client.table("lender_pincodes").insert(
+                    [{"lender_id": lender_id, "version": version, "pincode": p} for p in wanted]
+                ).execute()
+            try:
+                self._client.table("lenders").update({"published": True}).eq("id", lender_id).eq(
+                    "version", version
+                ).execute()
+            except Exception as exc:
+                if getattr(exc, "code", None) == "23505":  # idx_lenders_one_published
+                    raise ValueError(f"lender {lender_id!r} already has a published version") from exc
+                raise
+        except Exception:
+            try:
+                self._client.table("lenders").delete().eq("id", lender_id).eq("version", version).execute()
+            except Exception:  # best effort: the original failure is the one worth raising
+                pass
+            raise
 
     # ---- purge operations
 
