@@ -18,7 +18,7 @@ Contents: [1. Quick start](#1-quick-start) · [2. API](#2-api) · [3. Configurat
 [6. Tests, type-checking and evals](#6-tests-type-checking-and-evals) · [7. Operations](#7-operations) ·
 [8. Integration notes (SuperConnect / FulCRM)](#8-integration-notes-superconnect--fulcrm) ·
 [9. Open items and the owner decision register](#9-open-items-and-the-owner-decision-register) ·
-[10. Repository layout](#10-repository-layout)
+[10. Repository layout](#10-repository-layout) · [Appendix A. PRD §12 test mapping](#appendix-a-prd-12-test-mapping)
 
 ## 1. Quick start
 
@@ -265,8 +265,8 @@ uv run pyright            # strict; covers eligibility_agent, tests and scripts
 ```
 
 The conftest scrubs every service variable from the environment, forces tracing off and re-checks the kill switch around
-every test. The suite covers each PRD v1.1 section 12 required test (the item-by-item acceptance walk is the final task's).
-Where things live:
+every test. The suite covers each PRD v1.1 section 12 required test; the item-by-item mapping and the acceptance walk are in
+[Appendix A](#appendix-a-prd-12-test-mapping). Where things live:
 
 - Scenario suite through the real API and graph: `test_quick_happy_path`, `test_cache_sharing`, `test_quota_and_caps`,
   `test_pan_not_verified`, `test_ntc`, `test_full_check`, `test_timeout_and_locks`, `test_live_kill_switch`,
@@ -607,3 +607,73 @@ scripts/               purge_raw.py (TTL purge), seed_lenders.py
 tests/                 the suite (pytest-socket: no network)
 docs/                  PRD, the plan with the K1 to K22 rulings, design dossiers
 ```
+
+## Appendix A. PRD §12 test mapping
+
+The acceptance walk for PRD v1.1 section 12, run against commit `e9e03d7` on `feat/phase1-eligibility` (the last code commit
+before this appendix). A.1 maps each of the 22 "Required tests" to the files that pin it, A.2 walks the "Acceptance" clauses
+and the LangSmith paragraph, A.3 lists what the walk did not and could not cover. Everything here runs with no network;
+nothing was run with `SUREPASS_LIVE` set.
+
+### A.1 Required tests (PRD §12) to test files
+
+Paths are under `tests/`. "Pinned through the API" means the scenario drives the real FastAPI app, graph and `MemoryRepo` with
+the fake SurePass client and the fake ranking model; the API harness also runs the leak scan (`assert_no_leak`) over every
+view it returns, so "no leak" holds in every scenario, not only item 1.
+
+| # | PRD required test | Test file(s) | What is pinned |
+|---|---|---|---|
+| 1 | Quick happy path: PAN then Score once, billed, counted, no leak | `test_quick_happy_path.py`, `test_graph_wiring.py` | One PAN call then one Score call; row billed and counted; hand-written money pins (L1 368000 / 1277000, L2 clipped at its 500000 cap); the bureau call carries the PAN's own full name, never the LC-typed one |
+| 2 | Same PAN, second LC within 30 days: free, derivations re-run on new inputs | `test_cache_sharing.py`, `test_graph_wiring.py` | The second LC is a free hit (no call, not billed, not counted); ceiling and range come from its own income and from the lenders published now, not from the first run |
+| 3 | Sixth billed quick check refused | `test_quota_and_caps.py`, `test_admission_table.py` | `QUOTA_EXHAUSTED` on the sixth; a per-LC override of 7 admits it; a capped LC can still re-check a cached PAN; the day resets at IST midnight, not UTC |
+| 4 | PAN not verified: Rs 1 call only, no quota | `test_pan_not_verified.py`, `test_graph_wiring.py` | A valid-negative PAN makes one PAN call, billed, never counted, nothing cached; the corrected PAN then runs. A `success: false` PAN envelope is a `SUREPASS_FAILURE`, not this |
+| 5 | NTC on Score: counted, cached 30 d, co-applicant | `test_ntc.py`, `test_graph_wiring.py` | Every NTC envelope variant is counted, cached 30 days as NTC, headline `unlikely`, co-applicant suggested, NTC-accepting lenders only; `success: false` is never NTC |
+| 6 | Refresh of an expired score: billed, not counted | `test_quota_and_caps.py`, `test_graph_wiring.py` | An expired row gives a billed Score call marked `is_refresh` and not counted, even for an LC at 5 of 5; the 30-day window is exact to the minute |
+| 7 | 3-per-PAN-per-day hard cap locks the PAN | `test_quota_and_caps.py`, `test_graph_wiring.py`, `test_admission_table.py` | The fourth billed pull is refused `PAN_DAILY_CAP` with a day lock (which pre-empts even a would-be cache hit) and one review row; clears at the next IST midnight; resolved Score timeouts also reach the cap |
+| 8 | Full check before Offer refused | `test_full_check.py`, `test_admission_table.py`, `test_api_auth_and_validation.py` | `STAGE_TOO_EARLY` for every earlier stage and nothing billed; Offer and later admitted; an unknown stage is a 422 and records nothing |
+| 9 | Full check at Offer: PAN reused if under 180 d, Report once, Score cache refreshed, second opportunity on the same PAN inside 30 days is a free hit | `test_full_check.py`, `test_graph_wiring.py`, `test_high_confidence_full.py` | PAN record reused at 10 days and re-verified after 180; exactly one Report; the Report refreshes the Score cache so the next quick check is free; the second opportunity is a free hit; Refresh is refused inside the window and billed after it |
+| 10 | PAN correction once before a report, manager flag after | `test_pan_correction.py`, `test_admission_table.py`, `test_graph_wiring.py` | One free correction, logged on the check; after a report (including one pulled by a run whose ranking failed) or a second correction the change is `PAN_CHANGE_NEEDS_MANAGER` with a `pan_change_manager` review row; a refused attempt never spends the correction |
+| 11 | NTC warning unless acknowledged | `test_ntc_warning.py`, `test_graph_wiring.py` | `WARN_NTC_RECENT` carries the NTC pull's IST date and makes no Report call; the acknowledged re-check pulls a billed Report; the warning lasts exactly as long as the NTC score is fresh |
+| 12 | EMI algorithm on all four branches plus the stale and past-tenure flags | `test_emi_derivation_unit.py`, `test_emi_derivation.py`, `test_adapters.py` | Unit: each branch (reported, tenure remaining, revolving 5%, balance / 36), the past-tenure flag and confirm item, stale accounts (more than 90 days) excluded and surfaced. Graph level: the six-account report totals 21000 and a higher declared EMI wins |
+| 13 | Range upper / lower and clipping | `test_range_math.py`, `test_high_confidence_full.py`, `test_quick_happy_path.py` | Annuity upper and lower checked against a 60-digit `Decimal` oracle with half-up display; lower clipped up to the loan minimum, upper clipped to the loan maximum, both; clipping shows at graph level (L2 at its 500000 cap) |
+| 14 | No-pincode quick check returns the band read with `NO_PINCODE_ON_PAN` | `test_no_pincode.py`, `test_graph_wiring.py` | `ok` + `NO_PINCODE_ON_PAN`, confidence none, no lender, no model call; headline follows the band; a cached no-pincode PAN is still a free band read |
+| 15 | Model picks a lender outside the gate or below floor: demoted; none surviving goes to review | `test_model_misbehavior.py`, `test_safety_confidence.py`, `test_graph_wiring.py` | Out-of-gate and invented ids and below-floor picks are demoted with reasons; none surviving gives the `under_review` headline, no lender and a review row; alternate-only demotions are logged, not reviewed; safety rules 0 to 4 have unit vectors |
+| 16 | Model raises confidence: ignored | `test_model_misbehavior.py`, `test_safety_confidence.py`, `test_graph_wiring.py` | A raise is ignored on quick and on a medium full check and is never retried; a lowering is honoured; final confidence is never above the code's |
+| 17 | Model output invalid twice: `OPENAI_FAILURE` with the band read and gated list still returned | `test_model_misbehavior.py`, `test_graph_wiring.py`, `test_llm_seam.py` | Exactly two rank calls; `service_failure` + `OPENAI_FAILURE`; band-derived headline; at most two code-built, number-free alternates; billed and (quick only) counted; one invalid output then a valid one is a normal run |
+| 18 | Timeout locks the PAN 10 minutes and returns `pending_verification` | `test_timeout_and_locks.py`, `test_graph_wiring.py` | A Score or Report timeout is `pending_verification` with `code` null, a 10-minute lock and a reconciliation review; 11 minutes later the PAN is still `PAN_LOCKED` until the review is resolved; PAN-endpoint timeouts and transport errors lock nothing; the real httpx client is exercised through `MockTransport` |
+| 19 | Concurrent request refused `IN_FLIGHT` | `test_timeout_and_locks.py`, `test_graph_wiring.py` | A request while another holds the PAN is refused at once and never queued, including a genuinely concurrent pair of threads; an in-flight lock past its TTL is taken over |
+| 20 | Recompute re-runs without a SurePass call | `test_recompute_attach.py`, `test_graph_wiring.py` | A new check row (`recompute_of`) with zero SurePass calls, proven structurally by swapping the client for a scenario-less fake; the original row is unchanged; no quota use; 404 and 409 shapes; a purged raw object is `raw_unavailable` |
+| 21 | `SUREPASS_LIVE` unset makes every client call raise | `test_live_kill_switch.py`, `test_surepass_client.py`, `test_admission_table.py` | The live client raises `LiveCallsDisabled` before any I/O on all three endpoints and writes no sink row; only the exact string `true` is live; a degraded boot serves `/health` and refuses billed checks; cache hits still serve; the kill switch is the last admission rule |
+| 22 | Adapters | `test_adapters.py`, `test_envelope_builders.py`, `test_surepass_client.py` | Raw envelope to typed facts, total over junk bureau strings; the NTC rule; strict-bool Aadhaar link; no gender anywhere; `masked_aadhaar` never modelled; the synthetic builders (the only source of SurePass-shaped test data) are pinned, with a guard against real probe values |
+
+### A.2 Acceptance (PRD §12) walked clause by clause
+
+Evidence is from the walk at `e9e03d7`. PASS means demonstrated here; PENDING OWNER means it needs live credentials or a
+decision that is not in this repository.
+
+| Acceptance clause | Status | Evidence |
+|---|---|---|
+| All tests pass | PASS | `uv run pytest`: 3540 passed, 0 failed, 0 skipped, no network possible (pytest-socket). `pyproject.toml` already puts `-q` in `addopts`, so `uv run pytest -q` adds a second `-q` and prints only the progress dots, with no summary line; the exit code is still the verdict, and plain `uv run pytest` prints `3540 passed` |
+| `pyright` clean | PASS | `uv run pyright` (strict; covers `eligibility_agent`, `tests` and `scripts`): 0 errors, 0 warnings, 0 informations |
+| A LangSmith trace per API call | PASS offline; live trace PENDING OWNER | `POST /checks/quick`, `/checks/full` and `/checks/{id}/recompute` all run through the one `_run_graph` with the payload-free tracer; tags `tier:<kind>` and `lc:<id>`, plus `admission:<outcome>` when the root run is patched at finish, and metadata `check_id`, `pan_hash`, tier, admission plans and the billed / counted flags; pinned in `test_api_auth_and_validation.py` (tracer attached, root run patched through the same client) and `test_graph_wiring.py` (metadata only, no payloads, scrubbed exports). `/health` and `/attach` run no graph and are not traced. Nothing was sent to a real LangSmith project |
+| With `SUREPASS_LIVE` unset the service serves `/health` and returns `LIVE_CALLS_DISABLED` instead of calling | PASS | `test_live_kill_switch.py` (degraded boot on an empty environment). Also run as a real process: `env -i` with only `PATH` and `HOME`, `uv run uvicorn 'eligibility_agent.main:app_factory' --factory`, `GET /health` returned exactly `{"ok":true,"surepass_live":false}` and the section 2 quick-check example body returned HTTP 200 with `status: refused`, `code: LIVE_CALLS_DISABLED` |
+| Code review confirms no path from raw responses to `LcView` or to any LLM message | PASS (source audit); formal sign-off is the final whole-branch review | Greps over the source tree: raw envelopes and `storage_key` are read only by `fetch_raw` and the adapters (`graph/nodes.py`, the recompute path in `graph/build.py`) and leave as typed facts; `checks.internal` is built without storage keys, name or date of birth; `output/lc_view.py`, `graph/prompts.py` and `graph/llm.py` import no repo, db or SurePass module and mention neither `raw_envelope`, `storage_key` nor `fetch_raw`; `masked_aadhaar` appears only in the synthetic envelope builder, the client's request option and a comment saying it is not modelled; no band bucket string (`780+`, `720-780`, `650-720`, `<650`) appears in `output/lc_view.py` or any wire-model default. Runtime pins: `test_redaction.py`, `test_lc_view_builders.py`, `test_llm_seam.py` (the floor value and raw annuity never reach the model), `test_prompts.py` (a poisoned state renders none of the never-list), `test_graph_wiring.py` |
+| README covers env, seeding lenders and pincodes, running evals, and the open items | PASS | Section 3 (env table), sections 4.4 and 5 (seeding lenders and pincodes), section 6 Evals, section 9 (O1 to O11, D, B); `test_readme.py` keeps the env table, commands and paths from drifting |
+| Success metrics for the first 30 days (SurePass success rate, p95, cache hit rate, cost per lead, double-billing, persistence, log hygiene, schema-valid rate, review rate) | PENDING OWNER | Post-launch measurements, not build-time checks. Section 7.3 gives the p95 query, section 7.9 the spend and billing queries, section 7.1 the alerting. The structural guards exist (one billed pull per PAN per window, 3-per-PAN cap, every raw response persisted, payload-free logs and traces) |
+| Open items (O1 to O11) | PENDING OWNER | Listed with owners in section 9; none blocks the build |
+
+LangSmith paragraph of §12:
+
+| Clause | Status | Evidence |
+|---|---|---|
+| Datasets `eligibility-quick-golden` and `eligibility-full-golden` from synthetic fixtures | PASS | `eligibility_agent/evals/datasets.py`, pinned by `test_eval_datasets.py` (12 quick and 10 full examples, synthetic, guarded against the real probe values) |
+| Six deterministic evaluators (`no_leak`, `lenders_gated`, `numbers_from_code`, `confidence_not_raised`, `billing_consistency`, `outcome_matches_band`) | PASS | `eligibility_agent/evals/evaluators.py`, pinned by `test_evaluators.py`; `uv run python -m eligibility_agent.evals.run --mode local --llm fake --dataset both` exits 0: `22/22 examples passed all 6 evaluators` |
+| LLM judge on rationale wording; real model on at most 20 examples in CI | Built; not exercised | The judge exists only in `--mode langsmith` with `OPENAI_API_KEY` set (`test_eval_run.py` pins the wiring offline); the CI `evals-langsmith` job is informational and skipped without `LANGSMITH_API_KEY` |
+
+### A.3 Not covered by this walk
+
+- A live SurePass call, a real OpenAI ranking call and a real LangSmith trace: the owner smoke (one quick check on a consenting
+  identity with `SUREPASS_LIVE=true`; check the trace, the `checks` row, the bucket object and the consent row).
+- Applying `schema.sql` to Supabase, creating the private `raw-responses` bucket, the checkpointer role, `seed_lenders` and the
+  purge schedule (section 4).
+- The whole-branch code review. The audit above is a source-level grep audit, not a reviewer's judgement.
