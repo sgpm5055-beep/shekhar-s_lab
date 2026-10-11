@@ -1,0 +1,47 @@
+# Keeps the build context small and keeps secrets and scratch material out of it. The Dockerfile COPYs only
+# pyproject.toml, uv.lock, eligibility_agent/ and scripts/{__init__,purge_raw}.py, so this is the second fence, not the
+# first (tests/test_dockerfile.py pins that none of those COPY sources is ignored here).
+
+# Version control and agent / editor scratch (.superpowers holds build ledgers and reports, not code).
+.git
+.gitignore
+.github
+.superpowers
+.claude
+.vscode
+.idea
+.DS_Store
+**/.DS_Store
+
+# Environment and credentials: configuration reaches the container at runtime through the environment only.
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/service-account*.json
+
+# Not needed in the image: documentation, the test suite, the README. scripts/ is NOT excluded (purge_raw runs in the
+# container); scripts/seed_lenders.py imports tests.helpers, so seeding runs from a repository checkout instead.
+docs
+tests
+README.md
+
+# Local build and tool artifacts.
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.pyright
+.mypy_cache
+.ruff_cache
+**/*.egg-info
+build
+dist
+**/*.log
+**/*.tmp
+.coverage
+htmlcov
