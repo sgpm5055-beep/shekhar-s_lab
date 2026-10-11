@@ -170,6 +170,17 @@ def test_the_container_deploy_section_matches_the_dockerfile_and_the_code() -> N
     assert "docker build -t eligibility-agent ." in README
     default = Settings.model_fields["graph_timeout_seconds"].default
     assert f"`GRAPH_TIMEOUT_SECONDS`** (default {int(default)} s)" in deploy  # the timeout the platform limit must exceed
+    # the baked default, announced as a bold standalone line, is the Dockerfile's ENV and the name the code reads
+    assert re.search(r"^ENV .*LANGGRAPH_STRICT_MSGPACK=true", dockerfile, re.MULTILINE | re.DOTALL)
+    bold = [line for line in _section("### Deploy (container)").splitlines() if line.startswith("**`LANGGRAPH_STRICT_MSGPACK=true`")]
+    assert len(bold) == 1 and "is baked into the image as a default" in bold[0]
+    assert "CheckpointerConfigError" in deploy and "plain `ENV`" in deploy
+    # run examples publish on loopback only (a degraded boot has auth disabled); none publishes on every interface
+    assert "-p 127.0.0.1:8080:8080" in deploy and not re.search(r"-p \d+:\d+", deploy)
+    # pin upkeep and shutdown notes
+    assert "bump the digests regularly" in deploy and "COPY --from=" in deploy and ".github/dependabot.yml" in deploy
+    assert "build-constraint-dependencies" in deploy
+    assert "SIGTERM" in deploy and "180 s TTL" in deploy
     for module in set(re.findall(r"python -m ([\w.]+)", deploy)):  # the purge job the section runs in the container
         assert importlib.util.find_spec(module) is not None, module
         assert f"scripts/{module.rsplit('.', 1)[-1]}.py" in dockerfile, module  # ... is copied into the image

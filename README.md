@@ -52,16 +52,23 @@ in the image), the service installed as a wheel, a non-root user (UID 10001) and
 
 ```bash
 docker build -t eligibility-agent .
-docker run --rm -p 8080:8080 eligibility-agent                         # empty environment: the degraded boot above
-docker run --rm -p 8080:8080 --env-file ./prod.env eligibility-agent   # real configuration (section 3)
+# loopback only (127.0.0.1): a degraded boot has auth disabled, so never publish it on every interface
+docker run --rm -p 127.0.0.1:8080:8080 eligibility-agent                         # empty environment: the degraded boot above
+docker run --rm -p 127.0.0.1:8080:8080 --env-file ./prod.env eligibility-agent   # real configuration (section 3)
 ```
 
-- **Configuration is environment-only at runtime.** No `.env`, secret or setting is baked into the image; it holds code only.
-  Supply the section 3 variables through the platform's environment / secret settings (`docker --env-file` takes plain
-  `KEY=value` lines and does not strip quotes). Production needs at least `REPO_BACKEND=supabase` with its variables,
-  `SERVICE_API_TOKEN`, a non-default `IDENTITY_HMAC_KEY` and `OPENAI_API_KEY`; `SUREPASS_LIVE=true` with `SUREPASS_TOKEN` only
-  when billed calls are intended; and, when `DATABASE_URL` is set, `LANGGRAPH_STRICT_MSGPACK=true` (the app refuses to start
-  without it) plus `LANGSMITH_HIDE_INPUTS=true` / `LANGSMITH_HIDE_OUTPUTS=true` (7.5, 7.7).
+**`LANGGRAPH_STRICT_MSGPACK=true` is baked into the image as a default (a plain `ENV`, so the platform's environment can still
+override it).** With `DATABASE_URL` set the app refuses to start without it (`CheckpointerConfigError`), which on a platform such
+as Cloud Run looks like a container that failed to listen on `PORT`; without `DATABASE_URL` there is no checkpointer and it
+changes nothing. Do not override it: with `DATABASE_URL` set, any value other than `true` (or `1` / `yes`) makes startup fail
+(7.5).
+
+- **Configuration is environment-only at runtime.** No `.env` or secret is baked into the image, and the strict-msgpack flag
+  above is its only baked setting; everything else comes from the platform's environment / secret settings (the section 3
+  variables; `docker --env-file` takes plain `KEY=value` lines and does not strip quotes). Production needs at least
+  `REPO_BACKEND=supabase` with its variables, `SERVICE_API_TOKEN`, a non-default `IDENTITY_HMAC_KEY` and `OPENAI_API_KEY`;
+  `SUREPASS_LIVE=true` with `SUREPASS_TOKEN` only when billed calls are intended; and, recommended, `LANGSMITH_HIDE_INPUTS=true`
+  / `LANGSMITH_HIDE_OUTPUTS=true` (7.7).
 - **`PORT`.** The container listens on `$PORT` and falls back to 8080 (Cloud Run, Railway and Render inject `PORT`):
   `sh -c "exec uvicorn ... --port ${PORT:-8080}"`, so uvicorn is PID 1 and receives the platform's SIGTERM.
 - **Health.** The image's `HEALTHCHECK` is `GET /health` through python and urllib (slim has no curl); a platform doing its own
@@ -72,10 +79,18 @@ docker run --rm -p 8080:8080 --env-file ./prod.env eligibility-agent   # real co
 - **Set the platform's request timeout above `GRAPH_TIMEOUT_SECONDS`** (default 90 s), for example 120 s. Cloud Run's default
   of 300 s is already above it; check Railway and Render. A shorter limit cuts the connection while the graph is still running,
   so the caller sees a gateway error although the check can still bill and persist.
+- **A platform's shutdown grace is shorter than a long check.** On a deploy, scale-down or restart the platform sends SIGTERM and
+  kills the container after a short grace period (about 10 s on Cloud Run), but one check can run up to the 90 s graph budget, so
+  a long check in flight can be killed mid-flight (the caller sees an error; SurePass may already have billed). The PAN's
+  in-flight lock self-heals at its 180 s TTL, so a retry inside 3 minutes sees `IN_FLIGHT` (7.3).
 - **`DATABASE_URL` must be the Supabase session pooler (`:5432`) or a direct connection, never the transaction pooler
   (`:6543`)** (7.5); the app refuses `:6543`.
 - **SurePass egress.** The production token is whitelisted by IP (see the requirements above): confirm the platform's static
   egress option before going live.
+- **Pins: bump the digests regularly.** The python base image and the uv helper image are pinned by tag and digest, and the build
+  backend (hatchling and its dependencies) by `[tool.uv] build-constraint-dependencies` in `pyproject.toml`, so a rebuild does
+  not drift. `.github/dependabot.yml` opens weekly PRs for the Dockerfile's `FROM` lines (python patch releases only) and the
+  Actions pins; the uv helper pin is in a `COPY --from=`, which some updaters miss, so check it by hand when you bump.
 - **Purge job.** `scripts/purge_raw.py` ships in the image, so the TTL job can run as the platform's scheduled job:
   `docker run --rm --env-file ./prod.env eligibility-agent python -m scripts.purge_raw` (add `--dry-run` first; 4.5).
 - **Seeding runs from a repository checkout.** `scripts/seed_lenders.py` imports `tests.helpers` and `tests/` is deliberately
