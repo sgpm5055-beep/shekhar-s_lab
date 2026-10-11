@@ -11,7 +11,8 @@ plus its ``lender_pincodes`` rows. The criteria jsonb uses the ``db/schema.sql``
 ``min_age``, ``max_age_at_maturity``) and every field is ``{"value": ..., "status": "known"}``.
 
 * Never overwrites: a lender id that already has ANY version (published or draft) is skipped and reported, so reruns are
-  safe and an admin's edits are never touched.
+  safe and an admin's edits are never touched. To re-seed one lender, delete its ``lenders`` row first (its
+  ``lender_pincodes`` rows cascade).
 * ``--dry-run`` prints the rows it would write and exits 0 WITHOUT connecting to anything (no credentials needed), so it
   cannot tell which lenders already exist; a real run skips those.
 * Credentials come from SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY. Exit 0 on success, 2 on a usage / configuration error.
@@ -67,7 +68,8 @@ def run_seed(writer: LenderWriter, lenders: Sequence[SeedLender] = SEED_LENDERS)
                     lender.id,
                     lender.version,
                     "skipped",
-                    f"already present ({_versions_text(existing)}); left untouched",
+                    f"already present ({_versions_text(existing)}); left untouched; "
+                    "delete the lender row to re-seed (its pincodes cascade)",
                 )
             )
             continue

@@ -203,7 +203,10 @@ def test_a_real_run_prints_one_line_per_lender_and_the_synthetic_warning(capsys:
     assert "synthetic example lenders" in out
     capsys.readouterr()
     assert main([], backend=_writer(repo)) == 0
-    assert "skipped (already present (v1 published); left untouched)" in capsys.readouterr().out
+    assert (
+        "skipped (already present (v1 published); left untouched; delete the lender row to re-seed (its pincodes cascade))"
+        in capsys.readouterr().out
+    )
 
 
 def test_missing_credentials_exit_2_with_a_message(

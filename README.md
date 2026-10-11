@@ -134,7 +134,7 @@ Read straight from `os.environ`, deliberately **not** `Settings` fields:
 
 **A `.env` file feeds `Settings` only** (nothing calls `load_dotenv`). The three variables above, and everything the
 `scripts/` commands and the eval runner read themselves (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `RAW_BUCKET`,
-`LANGSMITH_API_KEY`, `OPENAI_API_KEY`), must be real exported environment variables. For local use,
+`LANGSMITH_API_KEY`, `OPENAI_API_KEY`, `OPENAI_MODEL`), must be real exported environment variables. For local use,
 `set -a; source .env; set +a` exports a plain `KEY=value` file.
 
 The per-call timeouts are fixed code constants and are deliberately **not** configurable: PAN Comprehensive 8 s, Experian
@@ -241,7 +241,8 @@ The three **synthetic** example lenders (L1 Alpha Education Finance, L2 Bharat U
 from `tests/helpers.SEED_LENDERS`, the single source the scenario suite and the eval goldens share. Each is written as one
 `lenders` row (version 1, published, `created_by = 'seed_lenders'`) plus its `lender_pincodes` rows. The script never
 overwrites: a lender id that already has any version, published or draft, is skipped and reported, so it is safe to re-run
-and never touches an admin's edits. It runs from a repository checkout because `tests/` is not in the wheel.
+and never touches an admin's edits. To re-seed one lender, delete its `lenders` row first (its pincodes cascade). It runs from a
+repository checkout because `tests/` is not in the wheel.
 
 **Staging and UAT only.** The seed pincodes are real postal codes, so in production a real learner would be matched to a
 fictional lender. If they were ever seeded there, take them down with
@@ -310,14 +311,15 @@ Notes:
 
 ### CI
 
-`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, with `uv sync --frozen` (a stale `uv.lock` fails the
-build):
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests (and on manual dispatch). Each job installs with
+`uv sync --locked --all-groups`, so a `uv.lock` that is out of step with `pyproject.toml` fails the build (`--frozen` would
+not), and the run steps use `uv run --frozen`:
 
 | Job | What | Gate |
 |---|---|---|
 | `test` | `pyright` then `pytest -q` | blocking |
 | `evals-local` | the local eval command above, fake model | blocking (non-zero exit fails it) |
-| `evals-langsmith` | LangSmith experiment, real model on at most 20 examples when `OPENAI_API_KEY` exists | informational (`continue-on-error`), **skipped, not failed, when `LANGSMITH_API_KEY` is absent** (forked PRs, or until the secret is configured) |
+| `evals-langsmith` | LangSmith experiment, real model on at most 20 examples when `OPENAI_API_KEY` exists | informational (`continue-on-error`). **Never runs on pull requests** (it holds secrets, and a PR can edit the code and workflow it executes); on pushes to `main` and manual runs it is **skipped, not failed, when `LANGSMITH_API_KEY` is absent** |
 
 `SUREPASS_LIVE` is never set anywhere in CI (a test pins that), so CI cannot spend credits.
 
@@ -381,6 +383,11 @@ update review_queue
 set resolved_at = now(), resolved_by = 'your.name'
 where id = '<review id>' and resolved_at is null;
 ```
+
+Resolving the row does **not** release the 10-minute timeout lock. While that lock is active every request on the PAN gets
+`PAN_LOCKED` (cache hits included); once it has expired, an unresolved review row keeps refusing billed pulls (cache hits are
+served again). A billed re-pull is admitted only when **both** have cleared: the lock has expired **and** the row is resolved,
+so resolving early still leaves the PAN locked until the 10 minutes are up.
 
 ### 7.3 Latency, the p95 budgets and timeouts
 
@@ -538,7 +545,7 @@ the owner disagrees. **B** items were found during the build. Nothing here block
 | O1 | Lender floors are CIBIL scores but the band is Experian (Credit) | Floors are entered and compared as Experian scores. Real lender floors need the equivalence decided before UAT |
 | O2 | Does SurePass cache on its side? (Shekhar with SurePass) | Unknown. The service's own caches (PAN 180 d, Score 30 d, Report 30 d) are independent of whatever SurePass may cache |
 | O3 | Soft vs hard pull in writing for both Experian endpoints (Shekhar with SurePass) | Unconfirmed. The service treats every successful Experian call as billable and counts it toward the 3-per-PAN-per-day cap |
-| O4 | Experian code tables for `Account_Type`, `Account_Status`, `Written_off_Settled_Status`, `Payment_Rating` (SurePass) | Not decoded: open accounts are read from `Date_Closed == ""`, any non-blank `Written_off_Settled_Status` counts as a written-off / settled signal, `Account_Type` is carried raw |
+| O4 | Experian code tables for `Account_Type`, `Account_Status`, `Written_off_Settled_Status`, `Payment_Rating` (SurePass) | Relied on by assumption, not decoded. An account is open when `Date_Closed == ""` **or `Account_Status == "11"`** (the PRD 8.2 predicate), so the code table bears directly on whether `"11"` really means open. Any non-blank `Written_off_Settled_Status` counts as a written-off / settled signal, and `Account_Type` is carried raw. `Payment_Rating` is the one of the four that is not read at all |
 | O5 | One NTC PAN and one wrong-PAN probe on consenting identities before the NTC branch is trusted (Shekhar) | The NTC rule is coded from the PRD (HTTP 200, `success: true`, no 3-digit `credit_score`); the bureau no-hit shape is untested live |
 | O6 | `get_contact: false` and `masked_aadhaar_variant` acceptance, one Rs 1 call (engineering) | The client sends `get_contact: false` and `masked_aadhaar_variant: "v1"` (PRD 8.2); the PRD's open item asks whether `"empty"` is accepted. Unverified live |
 | O7 | Two mockups, quick and full (design) | Out of scope for this repo |
@@ -564,6 +571,7 @@ the owner disagrees. **B** items were found during the build. Nothing here block
 | D11 | **LC-facing copy the PRD does not mandate** | The `pending_verification` and `PAN_LOCKED` copy drops any timed-retry promise (it would contradict the reconciliation gate); the `PAN_CHANGE_NEEDS_MANAGER` copy covers both of its triggers. Product may want to approve the wording |
 | D12 | **PAN-change rules** | A `manager_change` event does not spend the LC's one free correction; recompute rows carry the original check's consent |
 | D13 | **`CONSENT_MISSING` is defensive** | The schema makes `consent.given` literally `true` (owner ruling), so the API cannot produce this code today |
+| D14 | **CI does not build the LangSmith datasets on every run** (deviation from the design's CI sketch) | The design ran `--build-datasets` on each LangSmith job. It is manual instead (dispatch with `build_datasets` ticked) until the example upsert is verified against the live service, because a failing second upload would break every run after the first. Until someone uploads once, the informational job has no dataset to evaluate |
 
 ### B. Found during the build (decide, or accept the risk)
 

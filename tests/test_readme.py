@@ -103,6 +103,25 @@ def test_the_non_settings_variables_are_documented_in_the_readme_and_the_example
         assert f"# {name}=true" in ENV_EXAMPLE, name
 
 
+def test_every_variable_the_scripts_and_evals_read_themselves_is_in_the_must_export_list() -> None:
+    """A `.env` file feeds Settings only: whatever scripts/ and the eval runner read from the environment directly must be
+    named in the README paragraph that says to export it (CI-provided GITHUB_SHA excepted)."""
+    paragraph = _flat(README[README.index("**A `.env` file feeds `Settings` only**") :].split("\n\n", 1)[0])
+    read: set[str] = set()
+    sources = [*(REPO_ROOT / "scripts").glob("*.py"), *(REPO_ROOT / "eligibility_agent" / "evals").glob("*.py")]
+    for source in sources:
+        read |= set(re.findall(r'environ(?:\.get)?[\[(]\s*"([A-Z][A-Z0-9_]*)"', source.read_text(encoding="utf-8")))
+    read.discard("GITHUB_SHA")
+    assert {"SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "RAW_BUCKET", "OPENAI_API_KEY", "OPENAI_MODEL"} <= read
+    for name in read:
+        assert f"`{name}`" in paragraph, name
+
+
+def test_the_ci_install_flag_is_documented() -> None:
+    assert "`uv sync --locked --all-groups`" in README
+    assert "(`--frozen` would not)" in _flat(README)
+
+
 def test_the_fixed_timeouts_and_lock_ttl_quoted_match_the_code() -> None:
     sentence = (
         f"PAN Comprehensive {PAN_TIMEOUT_S:g} s, Experian Score {SCORE_TIMEOUT_S:g} s, Experian Report {REPORT_TIMEOUT_S:g} s, "
