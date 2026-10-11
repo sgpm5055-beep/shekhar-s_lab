@@ -33,8 +33,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 CONFIG_PY = REPO_ROOT / "eligibility_agent" / "config.py"
 
-# Read by the checkpointer factory straight from os.environ, deliberately not a Settings field.
-NOT_A_SETTING = frozenset({"LANGGRAPH_STRICT_MSGPACK"})
+# Read straight from os.environ (the checkpointer factory; create_app's forced tracing-hide defaults), deliberately not
+# Settings fields. Both appear in .env.example as recommended lines.
+NOT_A_SETTING = frozenset({"LANGGRAPH_STRICT_MSGPACK", "LANGSMITH_HIDE_INPUTS", "LANGSMITH_HIDE_OUTPUTS"})
 
 
 def _aliases() -> set[str]:
