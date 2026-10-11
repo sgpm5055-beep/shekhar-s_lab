@@ -1,0 +1,21 @@
+# Weekly update PRs for the two kinds of pin this repository keeps by hand:
+#   docker           the FROM lines in the Dockerfile (python tag + index digest). Note: the uv helper image is pinned in a
+#                    `COPY --from=`, which some updaters (Dependabot included, depending on version) do not parse: check
+#                    it by hand when bumping (README, Deploy (container)).
+#   github-actions   the exact release tags in .github/workflows/ci.yml (actions/checkout, astral-sh/setup-uv).
+# Python packages are deliberately not listed: uv.lock is the pin, and it is bumped with `uv lock --upgrade` on purpose.
+# tests/test_dockerfile.py pins this file.
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # requires-python is ">=3.12,<3.13" and uv.lock is a 3.12 lock: only patch bumps of the python image are wanted.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

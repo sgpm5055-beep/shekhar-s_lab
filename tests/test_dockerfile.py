@@ -2,8 +2,9 @@
 
 There is no Docker daemon on the machine this was written on, so nothing here builds an image. The `docker` job in
 .github/workflows/ci.yml builds it and smoke-tests the result (tests/test_ci_workflow.py pins how); this file pins the
-Dockerfile's own contract so an edit cannot quietly drop a rule: pinned base images, a locked production-only install, no
-secrets or `.env` baked in, a numeric non-root user, the PORT convention, a curl-free HEALTHCHECK, and that nothing the
+Dockerfile's own contract so an edit cannot quietly drop a rule: pinned base images and build backend, a locked
+production-only install, no secrets or `.env` baked in (one baked setting, strict msgpack), a numeric non-root user, the
+PORT convention, a curl-free proxy-proof HEALTHCHECK, the Dependabot config that keeps the pins fresh, and that nothing the
 container runs imports from `tests/` (which is not in the image).
 """
 
@@ -11,14 +12,19 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import shlex
+import subprocess
+import sys
 import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, cast
+from typing import Any, Final, cast
 
 import pytest
+import yaml
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[1]
 DOCKERFILE: Final = REPO_ROOT / "Dockerfile"
@@ -203,7 +209,10 @@ def test_the_healthcheck_uses_python_urllib_against_health_and_fails_on_non_200(
     assert command[:2] == ["python", "-c"] and len(command) == 3
     code = command[2]
     compile(code, "<healthcheck>", "exec")  # valid python
-    assert "urllib.request.urlopen(" in code and "/health" in code and "127.0.0.1" in code
+    assert "/health" in code and "127.0.0.1" in code
+    # a loopback probe must never go through an http_proxy the platform injects: no ProxyHandler({}) = a false "unhealthy"
+    assert "urllib.request.build_opener(urllib.request.ProxyHandler({}))" in code and "opener.open(" in code
+    assert "urlopen" not in code
     assert ".status == 200" in code and "sys.exit(0 if" in code and "else 1)" in code  # anything but a 200 exits 1
     assert "os.environ.get('PORT') or '8080'" in code  # the same PORT convention as the start command
     assert not re.search(r"\b(curl|wget)\b", _text().replace("slim has no curl", ""))
@@ -211,6 +220,38 @@ def test_the_healthcheck_uses_python_urllib_against_health_and_fails_on_non_200(
 
 
 # ---------------------------------------------------------------------------------------------------- secrets / config
+
+
+# Every ENV name the Dockerfile may set. The one SERVICE setting is LANGGRAPH_STRICT_MSGPACK (see the next test); the rest
+# are uv's build switches, PATH and python's runtime flags. Adding a name here is a deliberate decision.
+ALLOWED_ENV: Final = {
+    "UV_COMPILE_BYTECODE",
+    "UV_LINK_MODE",
+    "UV_NO_CACHE",
+    "UV_PYTHON_DOWNLOADS",
+    "PATH",
+    "PYTHONUNBUFFERED",
+    "PYTHONDONTWRITEBYTECODE",
+    "LANGGRAPH_STRICT_MSGPACK",
+}
+
+
+def _env(stage: int | None = None) -> dict[str, str]:
+    pairs = [token.split("=", 1) for i in _of("ENV", stage) for token in shlex.split(i.args)]
+    assert all(len(pair) == 2 for pair in pairs)
+    return {name: value for name, value in pairs}
+
+
+def test_strict_msgpack_is_the_one_baked_setting_and_stays_overridable() -> None:
+    """With DATABASE_URL set the app refuses to start unless LANGGRAPH_STRICT_MSGPACK is true, and on Cloud Run that reads
+    as "failed to listen on PORT". A plain ENV (not ARG, not a RUN-time export) so the platform's environment can override."""
+    assert set(_env()) == ALLOWED_ENV
+    assert _env(1)["LANGGRAPH_STRICT_MSGPACK"] == "true"
+    assert "LANGGRAPH_STRICT_MSGPACK" not in _env(0)  # it belongs to the image that runs, not the one that builds
+    assert not _of("ARG")
+    assert "LANGGRAPH_STRICT_MSGPACK" not in " ".join(_runs())  # no `export` / `RUN LANGGRAPH_...=` that would defeat -e
+    source = (REPO_ROOT / "eligibility_agent" / "graph" / "build.py").read_text(encoding="utf-8")
+    assert 'STRICT_MSGPACK_ENV: Final[str] = "LANGGRAPH_STRICT_MSGPACK"' in source  # the name the code actually reads
 
 
 def test_no_secret_or_service_configuration_is_baked_into_the_image() -> None:
@@ -406,3 +447,109 @@ def test_what_the_container_runs_imports_nothing_from_tests_or_the_evals(entry: 
     if entry == "scripts/purge_raw.py":
         scripts = {f.name for f in files if f.parent.name == "scripts"}
         assert scripts <= {"__init__.py", "purge_raw.py"}
+
+
+# ------------------------------------------------------------------------------------------- the probe, behaviourally
+
+_SERVER: Final = """
+import http.server, sys
+
+STATUS = int(sys.argv[1])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"ok":true}'
+        self.send_response(STATUS)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+"""
+
+
+def _probe_code() -> str:
+    probe = _of("HEALTHCHECK")[0].args.partition(" CMD ")[2]
+    return _exec_form(probe)[2]
+
+
+def _run_probe(port: int) -> int:
+    """The image's HEALTHCHECK program, verbatim, in a subprocess whose environment points http(s)_proxy at a dead port."""
+    dead_proxy = "http://127.0.0.1:9"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PORT": str(port),
+        "http_proxy": dead_proxy,
+        "HTTP_PROXY": dead_proxy,
+        "https_proxy": dead_proxy,
+        "HTTPS_PROXY": dead_proxy,
+    }
+    return subprocess.run([sys.executable, "-c", _probe_code()], env=env, capture_output=True, timeout=30).returncode
+
+
+def _serve(status: int) -> tuple[subprocess.Popen[str], int]:
+    server = subprocess.Popen([sys.executable, "-c", _SERVER, str(status)], stdout=subprocess.PIPE, text=True)
+    assert server.stdout is not None
+    return server, int(server.stdout.readline())
+
+
+def test_the_healthcheck_program_passes_on_200_fails_on_non_200_or_no_server_and_ignores_proxies() -> None:
+    """pytest-socket blocks sockets in THIS process only: the server and the probe run in child processes."""
+    healthy, healthy_port = _serve(200)
+    broken, broken_port = _serve(503)
+    gone, gone_port = _serve(200)
+    try:
+        assert _run_probe(healthy_port) == 0  # with http_proxy set to a dead port: only a proxy bypass can pass
+        assert _run_probe(broken_port) == 1  # urllib raises on a 503
+    finally:
+        healthy.kill()
+        broken.kill()
+        gone.kill()
+        for process in (healthy, broken, gone):
+            process.wait(timeout=10)
+    assert _run_probe(gone_port) == 1  # nothing listens any more: connection refused
+
+
+# -------------------------------------------------------------------------------------------------------- pin upkeep
+
+
+def test_dependabot_opens_weekly_prs_for_the_docker_and_actions_pins() -> None:
+    doc = cast("dict[str, Any]", yaml.safe_load((REPO_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")))
+    assert doc["version"] == 2
+    updates = cast("list[dict[str, Any]]", doc["updates"])
+    assert {u["package-ecosystem"] for u in updates} == {"docker", "github-actions"}
+    for update in updates:
+        assert update["directory"] == "/"
+        assert cast("dict[str, Any]", update["schedule"])["interval"] == "weekly"
+    docker = next(u for u in updates if u["package-ecosystem"] == "docker")
+    ignored = cast("list[dict[str, Any]]", docker["ignore"])
+    # requires-python is <3.13 and uv.lock is a 3.12 lock: only patch bumps of the python image are wanted
+    assert {"dependency-name": "python", "update-types": ["version-update:semver-major", "version-update:semver-minor"]} in ignored
+    assert (REPO_ROOT / "Dockerfile").is_file() and (REPO_ROOT / ".github" / "workflows" / "ci.yml").is_file()
+    assert "dependabot" in _text()  # the Dockerfile says which pins it covers (and that the uv COPY --from may be missed)
+
+
+def test_the_build_backend_is_pinned_for_the_image_build_and_the_lock_records_it() -> None:
+    """hatchling and its dependencies are resolved at build time (they are not in uv.lock), so without these constraints
+    the image changes when one of them releases."""
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    constraints = cast("list[str]", pyproject["tool"]["uv"]["build-constraint-dependencies"])
+    pinned: dict[str, str] = {}
+    for constraint in constraints:
+        match = re.fullmatch(r"([A-Za-z0-9._-]+)==([A-Za-z0-9._!+-]+)", constraint)
+        assert match is not None, constraint  # exact pins only
+        pinned[match.group(1)] = match.group(2)
+    requires = cast("list[str]", pyproject["build-system"]["requires"])
+    for requirement in requires:
+        assert re.split(r"[<>=!~\[ ;]", requirement, maxsplit=1)[0] in pinned, requirement
+    assert "hatchling" in pinned
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    recorded = {
+        (m["name"], m["specifier"]) for m in cast("list[dict[str, str]]", lock["manifest"]["build-constraints"])
+    }
+    assert recorded == {(name, f"=={version}") for name, version in pinned.items()}  # `uv lock` was re-run

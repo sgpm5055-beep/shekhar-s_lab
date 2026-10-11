@@ -34,6 +34,20 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["eligibility_agent"]
 
+[tool.uv]
+# The Docker build installs the project as a wheel built in an isolated environment: its build-system.requires and their
+# dependencies are resolved at build time and are NOT in uv.lock. These constraints pin that environment (the versions
+# the lockfile-era build used), so the image does not change when hatchling or one of its dependencies releases. They
+# only constrain build environments, never the runtime resolution. Bump them deliberately (all six together).
+build-constraint-dependencies = [
+    "hatchling==1.32.4",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.6.0",
+    "tomlkit==0.15.1",
+    "trove-classifiers==2026.9.21.13",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]  # `tests.*` / `scripts.*` imports resolve from the repo root (no reliance on the editable install)
