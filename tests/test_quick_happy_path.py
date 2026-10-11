@@ -15,8 +15,9 @@ from typing import Any, Final
 
 import pytest
 
-from eligibility_agent.output.lc_view import LABEL_QUICK, LABEL_QUICK_NO_EMI, line_leaks
-from eligibility_agent.surepass.client import PAN_ENDPOINT, SCORE_ENDPOINT
+from eligibility_agent.output.lc_view import LABEL_QUICK, LABEL_QUICK_NO_EMI, MSG_INTERNAL, line_leaks
+from eligibility_agent.surepass.client import PAN_ENDPOINT, SCORE_ENDPOINT, FakeSurePassClient
+from eligibility_agent.testing import envelopes as env
 from eligibility_agent.testing.scenarios import happy_quick_scenario
 from tests.helpers import (
     LC_A,
@@ -35,6 +36,7 @@ from tests.helpers import (
     one_check_row,
     pan_hash_of,
     quick_payload,
+    seed_cached_quick_world,
 )
 
 L1_VIEW: Final[dict[str, Any]] = {
@@ -109,6 +111,37 @@ def test_bureau_call_sends_pan_full_name_not_the_lc_typed_name(make_api: ApiFact
     assert score_call.body == {"name": PAN_FULL_NAME, "mobile": MOBILE_OK, "pan": PAN_OK, "consent": "Y"}
     assert PAN_FULL_NAME.casefold() != LC_TYPED_NAME.casefold()  # the pin above would be vacuous otherwise
     assert LC_TYPED_NAME not in str([call.body for call in api.surepass.calls])
+
+
+@pytest.mark.parametrize("full_name", ["", "   "])
+@pytest.mark.parametrize("path", ["stored_pan_record", "fresh_pan_call"])
+def test_bureau_call_never_falls_back_to_the_lc_typed_name(make_api: ApiFactory, path: str, full_name: str) -> None:
+    """PRD 6: the LC-typed name lives ONLY in the consent record. A PAN record without a usable full_name (stored or
+    just pulled) ends the check in the error view BEFORE any bureau call; the typed name reaches no request body."""
+    if path == "stored_pan_record":
+        api = _happy(make_api)
+        seed_cached_quick_world(api.repo, pan=PAN_OK, fetched_at=T0 - timedelta(days=2), with_score=False,
+                                full_name=full_name)
+    else:
+        api = make_api(
+            lambda sink: FakeSurePassClient(
+                pan={PAN_OK: env.pan_comprehensive_envelope(pan=PAN_OK, full_name=full_name)},
+                score={PAN_OK: env.experian_score_envelope(credit_score="745")},
+                sink=sink,
+            )
+        )
+
+    body = api.quick()
+
+    assert (body["status"], body["code"], body["label"]) == ("service_failure", None, MSG_INTERNAL)
+    assert SCORE_ENDPOINT not in api.endpoints()  # ZERO bureau calls
+    assert api.endpoints() == ([] if path == "stored_pan_record" else [PAN_ENDPOINT])
+    assert all(LC_TYPED_NAME not in str(call.body) for call in api.surepass.calls)
+    row = one_check_row(api.repo)
+    assert (row.status, row.counted_against_quota) == ("error", False)
+    assert row.billed == any(api.billable(row.id))  # the PAN call's Rs 1 on the fresh path, nothing on the stored one
+    assert api.active_lock_kinds(PAN_OK) == []  # the boundary released the in-flight lock
+    assert api.repo.get_score_cache(pan_hash_of(PAN_OK)) is None
 
 
 def test_quick_happy_path_persistence(make_api: ApiFactory) -> None:

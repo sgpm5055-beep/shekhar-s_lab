@@ -733,8 +733,12 @@ def bureau_pull(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> S
     mobile = state.get("mobile")
     if not pan or not mobile:
         raise ValueError("a bureau call needs the raw PAN and mobile in state")
-    # Bureau calls send PAN Comprehensive's full_name; the LC-typed name lives in the consent record (PRD 6).
-    name = identity.full_name or state.get("name") or ""
+    # Bureau calls send PAN Comprehensive's full_name. The LC-typed name lives ONLY in the consent record (PRD 6) and is
+    # never a fallback: a PAN record without a usable full_name stops the check here, before any bureau spend, and the
+    # route's error boundary answers with the error view (message carries the check id only, no PII).
+    name = (identity.full_name or "").strip()
+    if not name:
+        raise RuntimeError(f"bureau_pull: the PAN record has no full_name to send (check_id={check_id})")
     endpoint = SCORE_ENDPOINT if kind == "quick" else REPORT_ENDPOINT
     now = deps.now()
     try:

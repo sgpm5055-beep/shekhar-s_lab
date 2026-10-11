@@ -579,13 +579,15 @@ def seed_cached_quick_world(
     with_pan_record: bool = True,
     with_score: bool = True,
     credit_score: str = "745",
+    full_name: str = PAN_FULL_NAME,
 ) -> None:
     """Pre-seed the raw bucket + ``pan_records`` and/or ``score_cache`` rows exactly as a pull at ``fetched_at`` would
-    have left them (raw envelope stored verbatim, rows pointing at it). Used where no pull may happen (live off)."""
+    have left them (raw envelope stored verbatim, rows pointing at it). Used where no pull may happen (live off), or to
+    plant a stored PAN record with an unusable ``full_name``."""
     pan_hash = pan_hash_of(pan)
     if with_pan_record:
         key = storage_key_for(pan_hash, PAN_ENDPOINT, fetched_at, new_id())
-        repo.raw_store.put_raw(key, env.pan_comprehensive_envelope(pan=pan)[1])
+        repo.raw_store.put_raw(key, env.pan_comprehensive_envelope(pan=pan, full_name=full_name)[1])
         repo.put_pan_record(
             PanRecordRow(
                 pan_hash=pan_hash,
