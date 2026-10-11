@@ -26,6 +26,7 @@ import pytest
 from langsmith.schemas import Example, Run
 
 from eligibility_agent.evals import evaluators
+from eligibility_agent.evals.datasets import full_examples, inputs_of, quick_examples
 from eligibility_agent.evals.evaluators import (
     DETERMINISTIC_EVALUATORS,
     JudgeVerdict,
@@ -38,6 +39,7 @@ from eligibility_agent.evals.evaluators import (
     numbers_from_code,
     outcome_matches_band,
 )
+from eligibility_agent.evals.run import run_one
 from eligibility_agent.surepass.client import PAN_ENDPOINT, REPORT_ENDPOINT, SCORE_ENDPOINT
 
 Dict = dict[str, Any]
@@ -746,3 +748,20 @@ def test_judge_factory_builds_the_pinned_chat_model_only_with_a_key(monkeypatch:
     assert structured == [{"schema": JudgeVerdict, "method": "function_calling"}]
     assert passes(judge, outputs_of())  # the judge runs through the stubbed chat model
     assert judge.__name__ == "plain_language_judge"
+
+
+# --------------------------------------------------------------------------- run_one smoke: two goldens, the real graph
+
+
+@pytest.mark.parametrize("example_id", ["q01_happy_745", "q05_score_success_false"])
+def test_every_deterministic_evaluator_passes_on_real_run_one_outputs_of_two_goldens(example_id: str) -> None:
+    """q01 (the happy quick check) and q05 (the v1.1 NTC reversal: success:false is a service failure) through the real
+    graph with the fake model and fake SurePass: the evaluators accept the run and the golden's literal expectations."""
+    example = next(e for e in [*quick_examples(), *full_examples()] if e["example_id"] == example_id)
+    inputs = inputs_of(example)
+
+    outputs = run_one(inputs)
+
+    for evaluator in DETERMINISTIC_EVALUATORS:
+        result = evaluator(dict(inputs), outputs, example["expected"])
+        assert result["score"] is True, (example_id, result)
