@@ -888,6 +888,26 @@ def test_a_failing_timeout_lock_write_still_leaves_the_reconciliation_gate() -> 
     assert view_of(retry).code == "PAN_LOCKED"  # ... yet the unresolved review alone still gates the re-pull (K2)
 
 
+def test_a_failing_reconciliation_insert_still_leaves_the_timeout_lock() -> None:
+    world = make_world(score_timeout)
+    world.repo.fail_review_insert = RuntimeError("review_queue unavailable")
+    with pytest.raises(RuntimeError):
+        run(world, check_state("quick", "chk-reviewdown"))
+    pan_hash = pan_hash_of()
+    locks = {lock.kind: lock for lock in world.repo.get_active_locks(pan_hash)}
+    assert locks["timeout"].lock_until == T0 + TIMEOUT_LOCK_TTL  # written in the finally, despite the review failure
+    nodes.fail_check(  # the route boundary releases the in-flight lock
+        world.deps, check_id="chk-reviewdown", kind="quick", lc_id=LC_ID, pan_hash=pan_hash, pan_last4="234F",
+        message="crash",
+    )
+    world.repo.fail_review_insert = None
+    world.clock.advance(timedelta(minutes=1))
+    retry_world = world.with_surepass(nothing_configured)
+    retry = run(retry_world, check_state("quick", "chk-after-reviewdown"))
+    assert view_of(retry).code == "PAN_LOCKED"  # no second pull on a spend-unknown PAN
+    assert retry_world.surepass.calls == [] and retry_world.calls("chk-after-reviewdown") == []
+
+
 def test_full_check_report_reuse_cache_hit() -> None:
     world = make_world(happy_full)
     run(world, check_state("full", "chk-report-pull"))
@@ -1343,6 +1363,15 @@ def test_a_poisoned_error_name_and_tag_export_scrubbed_while_pan_hash_survives()
     root = [p for p in exported if p.get("id") == run_id and p.get("extra")]
     assert root and all(p["extra"]["metadata"]["pan_hash"] == pan_hash_of() for p in root)  # intact, not scrubbed
     assert all(p["extra"]["metadata"]["check_id"] == "chk-poison" for p in root)
+
+    # finish_trace patches the root through client.update_run, bypassing the tracer: its tags are scrubbed too.
+    before = len(client.exported)
+    tracing.finish_trace(client, run_id=run_id, kind="quick", lc_id=f"lc-{PAN_OK}-720", check_id="chk-poison",
+                         pan_hash=pan_hash_of(), final_state={})
+    [patch] = client.exported[before:]
+    tags = cast("list[str]", patch["tags"])
+    assert tags == ["tier:quick", f"lc:lc-{tracing.TRACE_MASK}-{tracing.TRACE_MASK}", "admission:none"]
+    assert patch["extra"]["metadata"]["pan_hash"] == pan_hash_of()
 
 
 def test_trace_scrub_replaces_spans_and_fails_closed() -> None:

@@ -244,10 +244,13 @@ def finish_trace(
         return
     try:
         metadata = trace_metadata(kind=kind, check_id=check_id, pan_hash=pan_hash, final_state=final_state)
+        tags = [*base_tags(kind, lc_id), f"admission:{metadata['admission']}"]  # update_run replaces tags
         client.update_run(
             run_id,
-            tags=[*base_tags(kind, lc_id), f"admission:{metadata['admission']}"],  # update_run replaces tags
-            extra={"metadata": metadata},
+            # This patch bypasses PayloadFreeTracer, so its strings are scrubbed here (fix round 3); the metadata also
+            # goes through the scrub so a non-anonymizing client cannot export a raw string either.
+            tags=[scrub_trace_text(tag) for tag in tags],
+            extra={"metadata": scrub_trace_payload(metadata)},
         )
     except Exception as exc:  # tracing must never fail a check
         logger.warning("langsmith update_run failed (%s)", type(exc).__name__)

@@ -745,17 +745,21 @@ def bureau_pull(state: CheckState, config: RunnableConfig, deps: GraphDeps) -> S
     except SurePassTimeout as exc:
         # K2: spend unknown. The client already wrote the billable sink row; open the reconciliation gate (lock expiry
         # alone never re-admits a billed pull) and lock the PAN for 10 minutes -> pending_verification, code None (K1).
-        # The unresolved review row is written FIRST (fix round 1): it alone gates every re-pull (QK7 / FL6), so if the
-        # lock write then fails the stronger invariant already holds.
-        _insert_review(
-            repo,
-            now=now,
-            check_id=check_id,
-            pan_hash=pan_hash,
-            kind="timeout_reconciliation",
-            reason=f"{exc.endpoint} timed out (spend unknown); reconcile against the SurePass console before any re-pull",
-        )
-        repo.create_pan_lock(pan_hash, "timeout", check_id, now + TIMEOUT_LOCK_TTL)
+        # The unresolved review row goes FIRST (fix round 1: it alone gates every re-pull, QK7 / FL6, should the lock
+        # write fail) and the lock is written in ``finally`` (fix round 3: should the REVIEW write fail, the 10-minute
+        # lock still stops an immediate second pull on a spend-unknown PAN). Either failure then escapes to the route.
+        try:
+            _insert_review(
+                repo,
+                now=now,
+                check_id=check_id,
+                pan_hash=pan_hash,
+                kind="timeout_reconciliation",
+                reason=f"{exc.endpoint} timed out (spend unknown); reconcile against the SurePass console before any "
+                "re-pull",
+            )
+        finally:
+            repo.create_pan_lock(pan_hash, "timeout", check_id, now + TIMEOUT_LOCK_TTL)
         view = build_failure_lc_view(
             check_id=check_id,
             kind=kind,
