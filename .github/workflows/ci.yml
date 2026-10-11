@@ -1,10 +1,15 @@
 name: ci
 
-# Three jobs, none of which can spend SurePass credits or reach a SurePass endpoint:
+# Four jobs, none of which can spend SurePass credits or reach a SurePass endpoint:
 #
 #   test             pyright (strict) + pytest. Needs no secrets. pytest-socket blocks every TCP/UDP connection in-process.
 #   evals-local      the golden datasets against the fake model and fake SurePass. Needs no secrets. Fails on a non-zero
 #                    exit (an evaluator failed or a golden crashed).
+#   docker           builds the production image (Dockerfile) and smoke-tests it with NO environment at all (degraded boot):
+#                    the image's own contents, GET /health, the README's quick-check example, the image's HEALTHCHECK and
+#                    a clean stop. Pure docker + curl + jq on the runner (no uv). This job is the ONLY validation of the
+#                    Dockerfile (it cannot be built on the machine it was written on). Needs no secrets and sets no
+#                    container environment, so the live-call switch is off.
 #   evals-langsmith  INFORMATIONAL. Never runs on pull_request events: it holds secrets and executes code and workflow
 #                    text a PR can edit, so it runs only on pushes to main and manual dispatches. Even then it proceeds
 #                    only when the LANGSMITH_API_KEY secret exists (until someone configures it): without it the job
@@ -15,8 +20,9 @@ name: ci
 #                    unverified against the live service. Upload them with a manual "Run workflow" and the
 #                    build_datasets box ticked (do it twice the first time and check the example count does not double).
 #
-# The live-call switch for SurePass is never set anywhere in this file (tests/test_ci_workflow.py pins that): the client
-# refuses every outbound SurePass call unless that variable is exactly "true".
+# The live-call switch for SurePass is never set anywhere in this file (tests/test_ci_workflow.py pins that, with one
+# carve-out: the docker job's expected /health body names the response key): the client refuses every outbound SurePass
+# call unless that variable is exactly "true".
 #
 # The evals import tests/helpers, which is not part of the installed wheel, so every job runs from the repository root
 # (the checkout directory, the default working directory). Do not add a `working-directory` to the eval steps.
@@ -87,6 +93,108 @@ jobs:
         run: uv sync --locked --all-groups
       - name: Golden datasets, fake model (non-zero exit fails the job)
         run: uv run --frozen python -m eligibility_agent.evals.run --mode local --llm fake --dataset both
+
+  docker:
+    name: docker (build + degraded-boot smoke test)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: eligibility-agent:ci
+      CONTAINER: eligibility-ci
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image
+        run: docker build --tag "$IMAGE" .
+      # What is in the image, checked from inside it: the service imports from the installed wheel, the dev dependency
+      # group (pytest, pyright) is absent, the user is the fixed non-root UID, and the purge job's script ships (it exits
+      # 2 on a missing SUPABASE_URL, which also proves its imports resolve).
+      - name: Inspect the image
+        run: |
+          set -euo pipefail
+          test "$(docker inspect --format '{{.Config.User}}' "$IMAGE")" = "10001:10001"
+          docker run --rm --entrypoint python "$IMAGE" -c '
+          import importlib.util
+          import eligibility_agent.main as main
+          assert callable(main.app_factory)
+          leaked = [name for name in ("pytest", "pyright") if importlib.util.find_spec(name)]
+          assert not leaked, f"dev dependencies in the image: {leaked}"
+          print("eligibility_agent.main imports from", main.__file__)
+          '
+          code=0
+          docker run --rm --entrypoint python "$IMAGE" -m scripts.purge_raw --dry-run || code=$?
+          test "$code" = "2"
+      # NO -e / --env / --env-file: the empty environment is the point (degraded boot: in-memory repo, stub SurePass,
+      # auth disabled). tests/test_ci_workflow.py pins that no docker run here passes an environment.
+      - name: Boot with no environment and wait for readiness
+        run: |
+          set -euo pipefail
+          docker run --detach --name "$CONTAINER" --publish 127.0.0.1:8080:8080 "$IMAGE"
+          for _ in $(seq 1 60); do
+            if curl --silent --fail --max-time 2 --output /dev/null http://127.0.0.1:8080/health; then
+              echo "ready"
+              exit 0
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
+              echo "::error::the container exited before it became ready"
+              docker logs "$CONTAINER"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::the container was not ready after 60 s"
+          docker logs "$CONTAINER"
+          exit 1
+      - name: GET /health returns exactly the degraded-boot body
+        run: |
+          set -euo pipefail
+          body="$(curl --silent --show-error --fail --max-time 5 http://127.0.0.1:8080/health)"
+          echo "$body"
+          test "$(printf '%s' "$body" | jq -cS .)" = '{"ok":true,"surepass_live":false}'
+      # The README section 2 example body, verbatim. Degraded boot has no auth configured, so no bearer token is sent.
+      - name: POST /checks/quick is a 200 LIVE_CALLS_DISABLED refusal
+        run: |
+          set -euo pipefail
+          body='{"lc_id": "lc_1", "lead_id": "lead_1", "name": "Asha Example", "mobile": "9876543210", "pan": "ABCDE1234F", "consent": {"given": true, "wording_version": "v2-quick"}, "monthly_income": 60000, "existing_emi": 0}'
+          status="$(curl --silent --show-error --max-time 30 --output "$RUNNER_TEMP/quick.json" --write-out '%{http_code}' \
+            --request POST http://127.0.0.1:8080/checks/quick \
+            --header 'Content-Type: application/json' --data "$body")"
+          cat "$RUNNER_TEMP/quick.json"
+          echo
+          test "$status" = "200"
+          jq -e '.code == "LIVE_CALLS_DISABLED" and .status == "refused"' "$RUNNER_TEMP/quick.json"
+      # The image's own HEALTHCHECK (30 s interval): it must report healthy, which exercises the python + urllib probe.
+      - name: The image HEALTHCHECK reports healthy
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 24); do
+            state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER")"
+            echo "health: $state"
+            if [ "$state" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::the container never reported healthy"
+          exit 1
+      - name: Container logs
+        if: always()
+        run: docker logs "$CONTAINER" || true
+      # uvicorn is PID 1 (`exec` in CMD), so SIGTERM reaches it and it exits on its own: a 137 would mean docker had to
+      # SIGKILL it after the grace period.
+      - name: Stop the container
+        if: always()
+        run: |
+          set -euo pipefail
+          if docker inspect "$CONTAINER" > /dev/null 2>&1; then
+            docker stop "$CONTAINER"
+            code="$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")"
+            echo "exit code after docker stop: $code"
+            docker rm "$CONTAINER"
+            test "$code" != "137"
+          fi
 
   evals-langsmith:
     name: evals (LangSmith, informational)
