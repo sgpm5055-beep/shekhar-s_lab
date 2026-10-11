@@ -157,6 +157,24 @@ def test_the_run_command_and_the_module_commands_resolve() -> None:
         assert importlib.util.find_spec(command) is not None, command
 
 
+def test_the_container_deploy_section_matches_the_dockerfile_and_the_code() -> None:
+    deploy = _flat(_section("### Deploy (container)"))
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    image = re.search(r"^FROM (python:[\w.-]+)@sha256:[0-9a-f]{64} AS builder$", dockerfile, re.MULTILINE)
+    user = re.search(r"^USER (\d+):\d+$", dockerfile, re.MULTILINE)
+    assert image is not None and user is not None
+    assert f"`{image.group(1)}`" in deploy and f"UID {user.group(1)}" in deploy
+    assert "`EXPOSE 8080`" in deploy and re.search(r"^EXPOSE 8080$", dockerfile, re.MULTILINE)
+    assert "`uv sync --locked --no-dev`" in deploy and "uv sync --locked --no-dev" in dockerfile
+    assert "--port ${PORT:-8080}" in deploy and "--port ${PORT:-8080}" in dockerfile
+    assert "docker build -t eligibility-agent ." in README
+    default = Settings.model_fields["graph_timeout_seconds"].default
+    assert f"`GRAPH_TIMEOUT_SECONDS`** (default {int(default)} s)" in deploy  # the timeout the platform limit must exceed
+    for module in set(re.findall(r"python -m ([\w.]+)", deploy)):  # the purge job the section runs in the container
+        assert importlib.util.find_spec(module) is not None, module
+        assert f"scripts/{module.rsplit('.', 1)[-1]}.py" in dockerfile, module  # ... is copied into the image
+
+
 def test_documented_paths_and_links_exist() -> None:
     for target in set(re.findall(r"\]\(([^)#]+)\)", README)):
         if "://" not in target:

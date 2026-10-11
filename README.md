@@ -43,6 +43,48 @@ no ranking model, auth disabled (a warning is logged). `GET /health` answers `{"
 check request comes back as a `LIVE_CALLS_DISABLED` refusal instead of calling anything. That is the safe default for
 development, because development runs on production credits.
 
+### Deploy (container)
+
+The `Dockerfile` builds the production image: two stages on `python:3.12.15-slim-trixie` (pinned by digest), uv from a pinned
+image, `uv sync --locked --no-dev` (the runtime dependencies exactly as locked; pytest, pyright and the other dev tools are not
+in the image), the service installed as a wheel, a non-root user (UID 10001) and `EXPOSE 8080`. `.dockerignore` keeps `.git`,
+`.env*`, `docs/`, `tests/` and scratch files out of the build context.
+
+```bash
+docker build -t eligibility-agent .
+docker run --rm -p 8080:8080 eligibility-agent                         # empty environment: the degraded boot above
+docker run --rm -p 8080:8080 --env-file ./prod.env eligibility-agent   # real configuration (section 3)
+```
+
+- **Configuration is environment-only at runtime.** No `.env`, secret or setting is baked into the image; it holds code only.
+  Supply the section 3 variables through the platform's environment / secret settings (`docker --env-file` takes plain
+  `KEY=value` lines and does not strip quotes). Production needs at least `REPO_BACKEND=supabase` with its variables,
+  `SERVICE_API_TOKEN`, a non-default `IDENTITY_HMAC_KEY` and `OPENAI_API_KEY`; `SUREPASS_LIVE=true` with `SUREPASS_TOKEN` only
+  when billed calls are intended; and, when `DATABASE_URL` is set, `LANGGRAPH_STRICT_MSGPACK=true` (the app refuses to start
+  without it) plus `LANGSMITH_HIDE_INPUTS=true` / `LANGSMITH_HIDE_OUTPUTS=true` (7.5, 7.7).
+- **`PORT`.** The container listens on `$PORT` and falls back to 8080 (Cloud Run, Railway and Render inject `PORT`):
+  `sh -c "exec uvicorn ... --port ${PORT:-8080}"`, so uvicorn is PID 1 and receives the platform's SIGTERM.
+- **Health.** The image's `HEALTHCHECK` is `GET /health` through python and urllib (slim has no curl); a platform doing its own
+  probe should use `/health` too (no auth, no dependency probes).
+- **One uvicorn worker per container; scale horizontally.** Run more instances, not `--workers`. On the supabase backend the
+  in-flight lock, quotas and caches live in the database, so instances share them; the memory backend does not and stays
+  single-instance and development-only (7.10).
+- **Set the platform's request timeout above `GRAPH_TIMEOUT_SECONDS`** (default 90 s), for example 120 s. Cloud Run's default
+  of 300 s is already above it; check Railway and Render. A shorter limit cuts the connection while the graph is still running,
+  so the caller sees a gateway error although the check can still bill and persist.
+- **`DATABASE_URL` must be the Supabase session pooler (`:5432`) or a direct connection, never the transaction pooler
+  (`:6543`)** (7.5); the app refuses `:6543`.
+- **SurePass egress.** The production token is whitelisted by IP (see the requirements above): confirm the platform's static
+  egress option before going live.
+- **Purge job.** `scripts/purge_raw.py` ships in the image, so the TTL job can run as the platform's scheduled job:
+  `docker run --rm --env-file ./prod.env eligibility-agent python -m scripts.purge_raw` (add `--dry-run` first; 4.5).
+- **Seeding runs from a repository checkout.** `scripts/seed_lenders.py` imports `tests.helpers` and `tests/` is deliberately
+  not in the image, so seed from a checkout (section 5; staging and UAT only).
+- **Validation, honestly.** The image has not been built by hand: the `docker` job in CI builds it from this `Dockerfile` and
+  smoke-tests it with an empty environment (the image's contents, `GET /health`, the section 2 quick-check example answering
+  `LIVE_CALLS_DISABLED`, its `HEALTHCHECK`, a clean stop). It has not been run against Supabase, SurePass or OpenAI, and no
+  platform has run it yet: a first deploy is its first real test.
+
 ## 2. API
 
 Auth: `Authorization: Bearer <SERVICE_API_TOKEN>` on every route except `/health` (open only when no token is configured,
@@ -208,7 +250,8 @@ See section 5. For production the real lenders are loaded through the criteria a
 ### 4.5 Schedule the purge job
 
 `scripts/purge_raw.py` is the day-one TTL job. It needs `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and (if changed)
-`RAW_BUCKET`, and runs from a repository checkout (the `scripts/` package is not in the wheel). It does three things, in order:
+`RAW_BUCKET`, and runs from a repository checkout (the `scripts/` package is not in the wheel) or from the container image, which
+ships `scripts/purge_raw.py` (Deploy (container) in section 1). It does three things, in order:
 
 1. For `surepass_calls` rows past `purge_after` (call time + 180 days) that are not yet `purged_at`: delete the storage objects in
    batches of 100, then set `purged_at`. The call-log metadata row is kept forever; only the raw object dies.
@@ -311,14 +354,16 @@ Notes:
 
 ### CI
 
-`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests (and on manual dispatch). Each job installs with
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests (and on manual dispatch). Each uv job installs with
 `uv sync --locked --all-groups`, so a `uv.lock` that is out of step with `pyproject.toml` fails the build (`--frozen` would
-not), and the run steps use `uv run --frozen`:
+not), and the run steps use `uv run --frozen`. The `docker` job uses no uv on the runner (the Dockerfile's own installs are
+`uv sync --locked --no-dev`, for the same reason):
 
 | Job | What | Gate |
 |---|---|---|
 | `test` | `pyright` then `pytest -q` | blocking |
 | `evals-local` | the local eval command above, fake model | blocking (non-zero exit fails it) |
+| `docker` | builds the `Dockerfile`, runs the image with **no environment** (degraded boot) and asserts: the image's contents (non-root, no dev dependencies, `scripts/purge_raw.py` present), `GET /health` is exactly `{"ok":true,"surepass_live":false}`, the section 2 quick-check example answers 200 `LIVE_CALLS_DISABLED`, the image's own `HEALTHCHECK` turns healthy, and `docker stop` ends it without a kill | blocking |
 | `evals-langsmith` | LangSmith experiment, real model on at most 20 examples when `OPENAI_API_KEY` exists | informational (`continue-on-error`). **Never runs on pull requests** (it holds secrets, and a PR can edit the code and workflow it executes); on pushes to `main` and manual runs it is **skipped, not failed, when `LANGSMITH_API_KEY` is absent** |
 
 `SUREPASS_LIVE` is never set anywhere in CI (a test pins that), so CI cannot spend credits.
@@ -604,6 +649,8 @@ eligibility_agent/
   evals/               goldens, evaluators, runner
   testing/             synthetic envelopes, FrozenClock, fake model and scenarios
 scripts/               purge_raw.py (TTL purge), seed_lenders.py
+Dockerfile             production image (uv, non-root, PORT-aware); built and smoke-tested by the `docker` CI job
+.dockerignore          keeps .git, .env*, tests, docs and scratch out of the build context
 tests/                 the suite (pytest-socket: no network)
 docs/                  PRD, the plan with the K1 to K22 rulings, design dossiers
 ```
