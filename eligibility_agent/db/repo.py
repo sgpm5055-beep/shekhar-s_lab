@@ -509,7 +509,7 @@ class MemoryRepo:
     IST-day logic mirrors the SQL functions; lock semantics mirror acquire_pan_lock (steal only when the held
     lock is released or expired); the status/code CHECK, the terminal guard, the one-published-version index
     and the surepass_calls -> checks FK are enforced. Non-protocol helpers for tests and evals: seed_lender,
-    set_quota_override, resolve_review, list_checks, list_consents, list_reviews, list_calls,
+    set_lender_published, set_quota_override, resolve_review, list_checks, list_consents, list_reviews, list_calls,
     active_locks_snapshot.
     """
 
@@ -849,6 +849,15 @@ class MemoryRepo:
             matched_pincodes=(),
         )
         self._lender_pincodes[(lender_id, version)] = frozenset(pincodes)
+
+    def set_lender_published(self, lender_id: str, version: int, published: bool) -> None:
+        """The admin's publish / unpublish flip. KeyError for an unknown (id, version); ValueError when publishing while
+        ANOTHER version of the lender is published (idx_lenders_one_published). Idempotent."""
+        key = (lender_id, version)
+        row = self._lenders[key]  # KeyError on an unknown version
+        if published and any(r.id == lender_id and r.published and k != key for k, r in self._lenders.items()):
+            raise ValueError(f"lender {lender_id!r} already has a published version (idx_lenders_one_published)")
+        self._lenders[key] = replace(row, published=published)
 
     def set_quota_override(self, lc_id: str, daily_quota: int) -> None:
         if daily_quota < 0:

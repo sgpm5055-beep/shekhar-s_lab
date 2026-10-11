@@ -1073,6 +1073,23 @@ def test_seed_lender_mirrors_the_one_published_version_index() -> None:
         repo.seed_lender("L9", 1, "bad pincode", True, CRITERIA, "", ["012345"])  # mirrors the pincode CHECK
 
 
+def test_set_lender_published_is_the_admin_publish_flip_under_the_one_published_index() -> None:
+    """The admin's publish / unpublish action (test + eval helper): matching sees the change on the next read, and a
+    second published version of the same lender is refused (idx_lenders_one_published)."""
+    repo = MemoryRepo(FrozenClock())
+    _seed(repo)  # L1 v1 published, L1 v2 draft
+    with pytest.raises(ValueError):
+        repo.set_lender_published("L1", 2, True)  # v1 is still published
+    repo.set_lender_published("L1", 1, False)
+    assert [r.id for r in repo.published_lenders()] == ["L2"]
+    assert [r.id for r in repo.lenders_for_pincodes(["400001"])] == []  # only L1 v1 carried it
+    repo.set_lender_published("L1", 2, True)
+    assert [(r.id, r.version, r.name) for r in repo.lenders_for_pincodes(["700001"])] == [("L1", 2, "Alpha v2 draft")]
+    repo.set_lender_published("L1", 2, True)  # idempotent
+    with pytest.raises(KeyError):
+        repo.set_lender_published("L9", 1, False)  # no such (id, version)
+
+
 # --------------------------------------------------------------------------- serialisation sanity
 
 
