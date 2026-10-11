@@ -449,13 +449,19 @@ JUDGE_KEY: Final[str] = "plain_language_judge"
 JUDGE_MODEL: Final[str] = "gpt-4.1"
 JUDGE_TIMEOUT_S: Final[float] = 8.0
 JUDGE_RUBRIC: Final[str] = (
-    "You are reviewing short notes shown to a loan counsellor about a learner's financing options. "
-    "Score 1 only if EVERY note below is: (a) plain language a non-specialist understands; (b) free of credit scores and "
-    "bureau jargon, describing the credit profile in words only (for example 'strong', 'thin'); (c) actionable, saying "
-    "what to confirm or do next; (d) free of any promise or guarantee of approval or of a loan amount; (e) sensible for "
-    "an Indian education-financing context (INR, EMI, co-applicant). Otherwise score 0. "
-    "Reply with a score (0 or 1) and one or two sentences of reasons."
-)
+    "You are reviewing the notes a financing agent wrote for a sales consultant (LC) who is live on a call with a learner "
+    "in India: a short rationale per lender, conditions to confirm, and sometimes a co-applicant reason. Score 1 only if "
+    "ALL hold:\n"
+    "1. Plain language a non-finance person says aloud naturally; no jargon (no 'FOIR', 'DPD', 'tradeline', 'bureau', "
+    "'delinquency', 'headroom').\n"
+    "2. Band-driven, not number-driven: profile strength in words ('strong profile', 'existing EMIs are high relative to "
+    "income'); NO credit score, NO 3-digit number, NO bureau or lender-internal terminology.\n"
+    "3. Actionable for the call: tells the LC what to do next (proceed / suggest a co-applicant / confirm a fact with the "
+    "learner / raise for review).\n"
+    "4. Each note is short (at most 200 characters), INR context only.\n"
+    "5. Never promises approval or an amount; recommendation wording only ('indicative', 'suggest', 'likely').\n"
+    "Return a score (0 or 1) and one line per failed criterion."
+)  # the v1.0 rubric, reworded for rationale / conditions / co-applicant reason (no talking-points count)
 
 
 class JudgeVerdict(BaseModel):
