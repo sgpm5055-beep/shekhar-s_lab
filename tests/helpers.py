@@ -76,8 +76,7 @@ AUTH: Final[dict[str, str]] = {"Authorization": f"Bearer {TOKEN}"}
 
 PAN_OK: Final[str] = scenarios.PAN_OK  # "ABCPE1234F": person, valid, zip 560001
 PAN_TWO: Final[str] = "FGHPJ5678K"
-PAN_THREE: Final[str] = "QRSPT2468M"  # PAN-correction and manager-change vectors need more valid person PANs
-PAN_FOUR: Final[str] = "UVWPX1357N"
+PAN_THREE: Final[str] = "QRSPT2468M"  # PAN-correction and manager-change vectors need a third valid person PAN
 PAN_NTC: Final[str] = scenarios.PAN_NTC  # "KLMPN4321Q"
 PAN_COMPANY: Final[str] = scenarios.PAN_COMPANY  # "AAACA9999Z"
 PAN_INVALID: Final[str] = scenarios.PAN_INVALID  # "ZZZPZ0000Z"
@@ -97,7 +96,6 @@ IDENTITY_LITERALS: Final[tuple[str, ...]] = (
     PAN_OK,
     PAN_TWO,
     PAN_THREE,
-    PAN_FOUR,
     PAN_NTC,
     PAN_COMPANY,
     PAN_INVALID,

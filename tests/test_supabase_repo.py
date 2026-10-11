@@ -7,7 +7,7 @@ network (pytest-socket stays on): filters, rpc names/params, upload options, row
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import pytest
 from fake_supabase import FakeSupabase
@@ -30,6 +30,8 @@ from repo_builders import (
 )
 
 from eligibility_agent.db.repo import (
+    REPORT_ON_RECORD_STATUSES,
+    CheckStatus,
     PurgeRepo,
     RawStore,
     RawUnavailable,
@@ -37,7 +39,9 @@ from eligibility_agent.db.repo import (
     SupabaseRawStore,
     SupabaseRepo,
     create_supabase_backend,
+    report_check_on_record,
 )
+from eligibility_agent.graph.state import Code
 
 
 def _build() -> tuple[SupabaseRepo, FakeSupabase, FrozenClock]:
@@ -402,6 +406,22 @@ def test_pan_events_ordered_ascending_and_report_exists() -> None:
     assert repo.report_exists_for_opportunity("opp-2") is False
     repo.insert_check(make_check(id="e", code="OPENAI_FAILURE", **failed))
     assert repo.report_exists_for_opportunity("opp-2") is True
+
+    repo.insert_check(make_check(id="f", kind="full", status="ok", opportunity_id="opp-3"))
+    assert repo.report_exists_for_opportunity("opp-3") is True
+
+
+def test_the_report_exists_prefilter_admits_every_status_the_predicate_accepts() -> None:
+    """Parity: SupabaseRepo pre-filters on REPORT_ON_RECORD_STATUSES before applying report_check_on_record, so every
+    (status, code) the predicate accepts must have its status in that tuple, and every status in it must be reachable
+    (the tuple is exact, not merely a superset)."""
+    accepted = {
+        status
+        for status in get_args(CheckStatus)
+        for code in (None, *get_args(Code))
+        if report_check_on_record(status, code)
+    }
+    assert accepted == set(REPORT_ON_RECORD_STATUSES)
 
 
 # --------------------------------------------------------------------------- lenders

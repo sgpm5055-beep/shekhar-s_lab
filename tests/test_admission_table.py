@@ -1115,6 +1115,15 @@ def _events(*specs: tuple[str, str]) -> list[Any]:
             "needs_manager",
             id="manager-change-then-report-exists",
         ),
+        # Ruling (fix round 1, ratified): a manager_change does NOT consume the LC's one free correction (the
+        # report-exists rule still caps reports).
+        pytest.param(
+            _events(("initial", PAN_A), ("manager_change", PAN_B)),
+            False,
+            "c" * 64,
+            "record_correction",
+            id="manager-change-leaves-the-correction-unspent",
+        ),
     ],
 )
 def test_evaluate_pan_change_table(events: list[Any], report_exists: bool, request_pan: str, expected: str) -> None:
