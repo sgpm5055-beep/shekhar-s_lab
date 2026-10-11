@@ -35,6 +35,7 @@ packages = ["eligibility_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # `tests.*` / `scripts.*` imports resolve from the repo root (no reliance on the editable install)
 addopts = "-q --strict-markers --disable-socket --allow-unix-socket"
 markers = [
     "eval: local golden-dataset eval runs",
