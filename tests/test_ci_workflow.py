@@ -239,3 +239,20 @@ def test_the_container_is_published_on_the_exposed_port_and_always_stopped() -> 
     health = next(i for i, step in enumerate(steps) if "State.Health" in str(step.get("run", "")))
     smoke = next(i for i, step in enumerate(steps) if "/checks/quick" in str(step.get("run", "")))
     assert smoke < health < stop  # the image's own HEALTHCHECK is waited on after the API assertions
+
+
+def test_a_red_docker_job_explains_itself() -> None:
+    """The job is the image's only validation. The probe's own output lives in .State.Health.Log, not in `docker logs`, so
+    both the HEALTHCHECK wait step's failure path and the always() diagnostics step must print it, with the container list
+    and the service log."""
+    steps = _steps("docker")
+    health_json = "docker inspect --format '{{json .State.Health}}' \"$CONTAINER\""
+    wait = next(step for step in steps if "State.Health.Status" in str(step.get("run", "")))
+    failure_path = str(wait["run"]).split("never reported healthy", 1)[1]
+    for command in ("docker ps --all", health_json, 'docker logs "$CONTAINER"'):
+        assert command in failure_path, command
+    diagnostics = next(step for step in steps if step.get("name") == "Container diagnostics")
+    assert diagnostics.get("if") == "always()"
+    for command in ("docker ps --all", health_json, 'docker logs "$CONTAINER"'):
+        assert command in str(diagnostics["run"]), command
+    assert str(diagnostics["run"]).count("|| true") == 3  # diagnostics never mask the real failure (or a missing container)

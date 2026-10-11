@@ -8,8 +8,9 @@ name: ci
 #   docker           builds the production image (Dockerfile) and smoke-tests it with NO environment at all (degraded boot):
 #                    the image's own contents, GET /health, the README's quick-check example, the image's HEALTHCHECK and
 #                    a clean stop. Pure docker + curl + jq on the runner (no uv). This job is the ONLY validation of the
-#                    Dockerfile (it cannot be built on the machine it was written on). Needs no secrets and sets no
-#                    container environment, so the live-call switch is off.
+#                    Dockerfile (it cannot be built on the machine it was written on). Needs no secrets and passes no
+#                    environment to the container (only the image's own baked LANGGRAPH_STRICT_MSGPACK default applies),
+#                    so the live-call switch is off.
 #   evals-langsmith  INFORMATIONAL. Never runs on pull_request events: it holds secrets and executes code and workflow
 #                    text a PR can edit, so it runs only on pushes to main and manual dispatches. Even then it proceeds
 #                    only when the LANGSMITH_API_KEY secret exists (until someone configures it): without it the job
@@ -139,12 +140,14 @@ jobs:
             fi
             if [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
               echo "::error::the container exited before it became ready"
+              docker ps --all
               docker logs "$CONTAINER"
               exit 1
             fi
             sleep 1
           done
           echo "::error::the container was not ready after 60 s"
+          docker ps --all
           docker logs "$CONTAINER"
           exit 1
       - name: GET /health returns exactly the degraded-boot body
@@ -178,10 +181,19 @@ jobs:
             sleep 5
           done
           echo "::error::the container never reported healthy"
+          # The probe's own stdout/stderr (a traceback, a refused connection) is in .State.Health.Log, not in docker logs.
+          docker ps --all
+          docker inspect --format '{{json .State.Health}}' "$CONTAINER"
+          docker logs "$CONTAINER"
           exit 1
-      - name: Container logs
+      # This job is the image's only validation, so a red run must explain itself without a re-run: the container list,
+      # the health state with the probe's own output, and the service log.
+      - name: Container diagnostics
         if: always()
-        run: docker logs "$CONTAINER" || true
+        run: |
+          docker ps --all || true
+          docker inspect --format '{{json .State.Health}}' "$CONTAINER" || true
+          docker logs "$CONTAINER" || true
       # uvicorn is PID 1 (`exec` in CMD), so SIGTERM reaches it and it exits on its own: a 137 would mean docker had to
       # SIGKILL it after the grace period.
       - name: Stop the container
