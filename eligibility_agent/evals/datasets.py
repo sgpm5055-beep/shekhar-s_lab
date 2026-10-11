@@ -173,19 +173,6 @@ def _ok_quick(**over: Any) -> dict[str, Any]:
     return base
 
 
-def _below_floor_610() -> dict[str, Any]:
-    expected = _ok_quick(
-        confidence="low",
-        coapplicant_suggested=True,
-        top_lender_id=None,
-        alternate_ids=[],
-        band="<650",
-    )
-    del expected["headline"]
-    expected["headline_in"] = ["not_fundable_alone", "under_review"]
-    return expected
-
-
 # --------------------------------------------------------------------------- quick (12)
 
 
@@ -400,16 +387,22 @@ def quick_examples() -> list[GoldenExample]:
             _ok_quick(lender_numbers={"L1": NO_NUMBERS, "L2": NO_NUMBERS}),
         ),
         _example(
-            # Score 610 -> band below 650: both pincode lenders (floor 650) are out of reach, so nobody survives: final
-            # confidence is low (headline only, no lender, PRD 9.4) with a co-applicant suggested. The headline itself is
-            # the MODEL's choice between two legal low-confidence ones (PRD 9.4: 'Under review' or 'Not fundable
-            # alone'): a model that names nobody (the fake) reads 'under_review', one whose floor-ignoring picks are all
-            # demoted reads 'not_fundable_alone'. Pinned as a set, not a point.
+            # Score 610 -> band below 650: both pincode lenders (floor 650) are out of reach. PRD 9.4: "No lender surviving
+            # the gate OR THE BAND is one path: low, 'Not fundable alone', co_applicant_suggested true, review queue".
+            # The compliant fake sees every floor fail and names nobody (safety demotes nothing), so the band alone
+            # decides: low confidence, no lender, headline 'not_fundable_alone', co-applicant suggested.
             "q11_band_610",
             "quick",
             quick_payload(),
             scenario("happy_quick", score="610"),
-            _below_floor_610(),
+            _ok_quick(
+                headline="not_fundable_alone",
+                confidence="low",
+                coapplicant_suggested=True,
+                top_lender_id=None,
+                alternate_ids=[],
+                band="<650",
+            ),
         ),
         _example(
             "q12_aadhaar_not_linked",
@@ -536,8 +529,8 @@ def full_examples() -> list[GoldenExample]:
         _example(
             # One report per PAN per 30 days, NOT per opportunity: opportunity 2, five days later, is a free hit that
             # re-derives on ITS declared income 80,000 (L1 available 0.55 x 80,000 - 3,500 = 40,500 -> raw upper
-            # 1,567,002.56 clipped to 15,00,000, raw lower 451,067.84; L2 available 32,500 -> upper clipped to
-            # 5,00,000, raw lower 354,494.07).
+            # 1,567,002.56 clipped to 15,00,000, raw lower 451,066.94; L2 available 32,500 -> upper clipped to
+            # 5,00,000, raw lower 354,493.92).
             "f06_second_opportunity_same_pan",
             "full",
             full_payload(opportunity_id=OPP_TWO, monthly_income=80000),

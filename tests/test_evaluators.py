@@ -644,16 +644,6 @@ def test_outcome_matches_the_goldens_pinned_fields() -> None:
         assert key in str(result["comment"]), (key, result)
 
 
-def test_headline_in_pins_a_set_of_legal_headlines() -> None:
-    """A model-dependent headline (PRD 9.4 low confidence: 'Under review' or 'Not fundable alone') is pinned as a SET."""
-    low = view(top_lender=None, alternates=[], headline="under_review", confidence="low", coapplicant_suggested=True)
-    legal = {"headline_in": ["not_fundable_alone", "under_review"]}
-    assert passes(outcome_matches_band, outputs_of(band="<650", lc_view=low, code_confidence="medium"), legal)
-    possible = view(top_lender=None, alternates=[], headline="possible", coapplicant_suggested=True)
-    result = run_eval(outcome_matches_band, outputs_of(band="<650", lc_view=possible), legal)
-    assert result["score"] is False and "headline" in str(result["comment"])
-
-
 def test_the_v11_ntc_reversal_pin_a_success_false_score_must_be_a_service_failure() -> None:
     """q05, eval level: the golden says service_failure + SUREPASS_FAILURE. A run that treated success:false as NTC (the
     v1.0 reading: ok / unlikely / counted) fails this evaluator even though every other invariant still holds."""

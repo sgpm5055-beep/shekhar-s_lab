@@ -393,9 +393,7 @@ def outcome_matches_band(inputs: Json, outputs: Json, reference_outputs: Json) -
     Band rules (PRD 9): a thin band (NTC, below 650) never reads 'fundable' and either names no lender or suggests a
     co-applicant; 'not_fundable_alone' always suggests one. Golden pins (when present): status, code, headline,
     confidence, co-applicant flag, top lender id, alternate ids, label, confirm items, Aadhaar warning, quick checks left,
-    both dates and the band itself; ``headline_in`` (a list) pins a headline the MODEL decides between legal alternatives
-    for (e.g. 'not_fundable_alone' when a floor-ignoring pick is demoted, 'under_review' when the model names nobody).
-    This is where the v1.1 NTC reversal is pinned at eval level (q05)."""
+    both dates and the band itself. This is where the v1.1 NTC reversal is pinned at eval level (q05)."""
     del inputs
     view = _view(outputs)
     if view is None:
@@ -415,10 +413,6 @@ def outcome_matches_band(inputs: Json, outputs: Json, reference_outputs: Json) -
     for key in _VIEW_PINS:
         if key in reference_outputs and view.get(key) != reference_outputs[key]:
             problems.append(f"{key}: got {view.get(key)!r}, golden {reference_outputs[key]!r}")
-    if "headline_in" in reference_outputs:
-        allowed = [str(h) for h in _as_list(reference_outputs["headline_in"]) or []]
-        if headline not in allowed:
-            problems.append(f"headline: got {headline!r}, golden one of {allowed}")
     if "top_lender_id" in reference_outputs:
         top = _as_mapping(view.get("top_lender"))
         top_id = None if top is None else top.get("id")

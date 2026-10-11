@@ -9,6 +9,7 @@ NTC reading, local mode builds no judge and exports no trace, and langsmith mode
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import json
@@ -145,6 +146,58 @@ def test_run_one_k7_survivors_are_the_code_built_floor_clearing_gate_survivors()
     assert outputs["derived"]["L1"]["ceiling"] == 1277000  # the code derived numbers; the view correctly shows none
 
 
+def test_run_one_k7_makes_exactly_two_rank_calls_with_the_retry_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """q04: the scripted model fails twice; the node calls it EXACTLY twice (one retry, never a third) and the second
+    call carries the first call's error. A spy over the model the runner actually builds."""
+    built: list[FakeRankModel] = []
+    original = run._rank_model
+
+    def spying(rank: str, llm: LlmMode) -> Any:
+        model = original(rank, llm)
+        assert isinstance(model, FakeRankModel)
+        built.append(model)
+        return model
+
+    monkeypatch.setattr(run, "_rank_model", spying)
+
+    outputs = run_one(inputs_of(BY_ID["q04_openai_invalid_twice"]))
+
+    assert len(built) == 1
+    model = built[0]
+    assert model.call_count == 2
+    assert [ctx.attempt for ctx in model.contexts] == [1, 2]
+    assert model.contexts[0].prior_error is None and model.contexts[1].prior_error
+    assert outputs["lc_view"]["code"] == "OPENAI_FAILURE"
+
+
+def test_run_one_reads_the_view_and_from_cache_from_the_persisted_row_not_the_state_view() -> None:
+    """The evaluator cross-checks ``from_cache`` against the view's own flag; that is only meaningful when the two come from
+    different sources. ``lc_view`` is the persisted row's JSON, ``from_cache`` the admission decision the row recorded."""
+    example = BY_ID["q07_cache_hit"]
+    world = run._build_world(inputs_of(example), "fake")  # pyright: ignore[reportPrivateUsage]
+    for step in inputs_of(example)["pre_state"]:
+        run._apply_step(world, step)  # pyright: ignore[reportPrivateUsage]
+    final = run._submit(world, "quick", example["request"])  # pyright: ignore[reportPrivateUsage]
+    check_id = cast("str", final["lc_view"].check_id)
+    row = world.repo._checks[check_id]  # pyright: ignore[reportPrivateUsage]
+    assert row.lc_view is not None
+    assert run._outputs_contract(world, final)["from_cache"] is True  # pyright: ignore[reportPrivateUsage]
+
+    row.lc_view["from_cache"] = False  # the persisted view disagrees with the recorded admission decision
+    outputs = run._outputs_contract(world, final)  # pyright: ignore[reportPrivateUsage]
+
+    assert outputs["lc_view"]["from_cache"] is False  # read back from the row, not from the state's LcView object
+    assert outputs["from_cache"] is True  # from the admission decision
+
+    row.internal["admission"]["admission"] = "new"  # pyright: ignore[reportOptionalSubscript]
+    assert run._outputs_contract(world, final)["from_cache"] is False  # pyright: ignore[reportPrivateUsage]
+    row.internal["admission"]["admission"] = "cache_hit"  # pyright: ignore[reportOptionalSubscript]
+    inputs = cast("Mapping[str, Any]", inputs_of(example))
+    result = DETERMINISTIC_EVALUATORS[4](inputs, outputs, example["expected"])
+    assert result["key"] == "billing_consistency" and result["score"] is False
+    assert "from_cache" in result["comment"]
+
+
 def test_run_one_a_refusal_reports_admission_refused_and_no_calls() -> None:
     outputs = run_one(inputs_of(BY_ID["q08_quota_exhausted"]))
 
@@ -193,8 +246,6 @@ def test_run_one_rejects_an_unknown_world_and_an_unknown_pre_state_op() -> None:
 
 
 def _mutations(key: str, value: Any, named: set[str]) -> list[Any]:
-    if key == "headline_in":
-        return [["x"]]
     if key == "lender_numbers":
         table = cast("dict[str, dict[str, Any]]", value)
         out: list[Any] = []
@@ -334,6 +385,42 @@ def test_a_run_exports_no_trace_even_with_tracing_switched_on_in_the_environment
         ls_utils.get_env_var.cache_clear()  # pyright: ignore[reportUnknownMemberType,reportFunctionMemberAccess]
 
 
+def test_run_one_traced_leaves_the_callers_tracing_context_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Langsmith mode runs the graph ``traced=True`` so node runs nest under the experiment row; the default (local) wraps
+    the run in ``tracing_context(enabled=False)``. Observed through a recorder in place of ``tracing_context`` (switching
+    tracing on for real would build a langsmith client and reach for the network)."""
+    contexts: list[Any] = []
+
+    def recording_context(**kwargs: Any) -> contextlib.AbstractContextManager[None]:
+        contexts.append(kwargs)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(run, "tracing_context", recording_context)
+    inputs = inputs_of(BY_ID["q01_happy_745"])
+
+    run_one(inputs)
+    assert contexts == [{"enabled": False}]
+    contexts.clear()
+    assert run_one(inputs, traced=True)["lc_view"]["status"] == "ok"
+    assert contexts == []  # the caller's context is untouched
+
+
+def test_the_langsmith_target_runs_traced_and_local_mode_does_not(monkeypatch: pytest.MonkeyPatch) -> None:
+    flags: list[bool] = []
+
+    def recording(inputs: GoldenInputs, llm: str = "fake", *, traced: bool = False) -> dict[str, Any]:
+        flags.append(traced)
+        return {}
+
+    monkeypatch.setattr(run, "run_one", recording)
+    spy, _, _ = _langsmith({"LANGSMITH_API_KEY": "ls"})
+    spy.calls[0]["target"](cast("dict[str, Any]", inputs_of(BY_ID["q01_happy_745"])))
+    assert flags == [True]
+    flags.clear()
+    run_local("quick", "fake", write=lambda _line: None)  # the stub returns no outputs, so the evaluators fail: ignored
+    assert flags == [False] * 12  # local mode never asks for tracing
+
+
 @pytest.mark.parametrize(
     ("argv", "environ", "message"),
     [
@@ -458,7 +545,7 @@ def test_the_target_runs_run_one_on_the_examples_inputs(monkeypatch: pytest.Monk
 def test_with_a_real_model_only_the_first_max_real_examples_run_real_the_rest_fake(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, str] = {}
 
-    def recording(inputs: GoldenInputs, llm: str = "fake") -> dict[str, Any]:
+    def recording(inputs: GoldenInputs, llm: str = "fake", *, traced: bool = False) -> dict[str, Any]:
         seen[inputs["example_id"]] = llm
         return {}
 

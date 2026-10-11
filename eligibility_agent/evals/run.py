@@ -12,8 +12,9 @@ that clock with the example's seed lenders published, a ``FakeSurePassClient`` p
 model), applies the pre-state steps, submits the request exactly as the route does (the route's request models, hashes and
 ``new_check_state``) to the compiled graph, and returns the outputs contract that ``evals.evaluators`` documents. Facts
 come from the persisted check row (billed / counted / internal), the repo's call log (``surepass_calls``) and the final
-graph state; nothing is recomputed. Tracing is switched off around the run (``tracing_context(enabled=False)``), so no env
-var in a developer's shell can make a local run export anything.
+graph state; nothing is recomputed. Tracing is switched off around a local run (``tracing_context(enabled=False)``), so no env
+var in a developer's shell can make a local run export anything; the langsmith-mode target runs ``traced=True`` so the
+graph's node runs nest under the experiment row (the data is synthetic).
 
 Gating (exit 2 = a usage / environment error, exit 1 = an evaluator failed, 0 = all green):
 
@@ -31,6 +32,7 @@ import os
 import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Final, Literal, TypeAlias, cast
@@ -251,12 +253,15 @@ def _outputs_contract(world: _World, final: Mapping[str, Any]) -> dict[str, Any]
     derived = _mapping(internal.get("derived"))
     band = derived.get("band")
     code_confidence = internal.get("code_confidence")
+    admission = _admission(internal)
     return {
-        "lc_view": raw_view.model_dump(mode="json"),
+        # What the LC received, read back from the persisted row; ``from_cache`` comes from the admission decision the
+        # row recorded, an independent source, so the evaluator's cross-check against the view's own flag is not vacuous.
+        "lc_view": row.lc_view if row.lc_view is not None else raw_view.model_dump(mode="json"),
         "billed": row.billed,
         "counted_against_quota": row.counted_against_quota,
-        "from_cache": raw_view.from_cache,
-        "admission": _admission(internal),
+        "from_cache": admission == "cache_hit",
+        "admission": admission,
         "surepass_calls": [
             {"endpoint": call.endpoint, "billable": call.billable} for call in world.repo.list_calls(raw_view.check_id)
         ],
@@ -268,9 +273,13 @@ def _outputs_contract(world: _World, final: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
-def run_one(inputs: GoldenInputs, llm: LlmMode = "fake") -> dict[str, Any]:
-    """Run one golden's inputs through the real graph and return the evaluator outputs contract (JSON-safe)."""
-    with tracing_context(enabled=False):
+def run_one(inputs: GoldenInputs, llm: LlmMode = "fake", *, traced: bool = False) -> dict[str, Any]:
+    """Run one golden's inputs through the real graph and return the evaluator outputs contract (JSON-safe).
+
+    Tracing is OFF by default (local mode: nothing may be exported whatever a developer's shell says). ``traced=True`` is
+    the langsmith-mode target's opt-in: it leaves the caller's tracing context alone, so the graph's node runs nest under
+    the experiment row."""
+    with nullcontext() if traced else tracing_context(enabled=False):
         world = _build_world(inputs, llm)
         for step in inputs["pre_state"]:
             _apply_step(world, step)
@@ -389,7 +398,7 @@ def run_langsmith(
 
     def target(inputs: dict[str, Any]) -> dict[str, Any]:
         golden = cast("GoldenInputs", inputs)
-        return run_one(golden, plan.get(golden["example_id"], "fake"))
+        return run_one(golden, plan.get(golden["example_id"], "fake"), traced=True)
 
     metadata = {"llm": llm, "max_real": max_real, "git_sha": environ.get("GITHUB_SHA", "")}
     for name in dataset_names(choice):

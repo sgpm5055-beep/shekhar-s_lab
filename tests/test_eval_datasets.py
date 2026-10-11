@@ -54,7 +54,7 @@ PRE_STATE_OPS: Final[frozenset[str]] = frozenset(
 )
 EXPECTED_KEYS: Final[frozenset[str]] = frozenset(
     {
-        "status", "code", "headline", "headline_in", "confidence", "coapplicant_suggested", "top_lender_id",
+        "status", "code", "headline", "confidence", "coapplicant_suggested", "top_lender_id",
         "alternate_ids", "label", "items_to_confirm", "pan_aadhaar_link_warning", "quick_checks_left_today",
         "checked_on", "refresh_available_on", "band", "gated_lender_ids", "lender_numbers", "billed",
         "counted_against_quota", "from_cache", "admission", "surepass_endpoints",
@@ -180,6 +180,19 @@ def test_q04_is_the_k7_view_with_the_band_derived_headline_and_number_free_alter
         "L2": {"ceiling": None, "range": None},
     }
     assert (expected["billed"], expected["counted_against_quota"]) == (True, True)  # K8: the spend happened
+
+
+def test_q11_pins_the_prd_94_no_lender_fits_the_band_path_as_a_point() -> None:
+    """Band 610 (every gated floor 650): low confidence, no lender, 'not_fundable_alone', co-applicant suggested. A point
+    pin, not a set: the headline is code-decided on this path whatever the model names (PRD 9.4)."""
+    expected = BY_ID["q11_band_610"]["expected"]
+    assert (expected["headline"], expected["confidence"], expected["coapplicant_suggested"]) == (
+        "not_fundable_alone",
+        "low",
+        True,
+    )
+    assert (expected["top_lender_id"], expected["alternate_ids"], expected["band"]) == (None, [], "<650")
+    assert "headline_in" not in expected
 
 
 def test_only_the_k7_golden_scripts_the_model() -> None:
