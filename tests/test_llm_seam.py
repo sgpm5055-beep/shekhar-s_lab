@@ -15,6 +15,7 @@ from typing import Any, Final, cast
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from pydantic import SecretStr
 from rank_builders import full_emi, gl, make_state, num, quick_emi, report_facts
 from rank_builders import derived as make_derived
 from rank_builders import identity as make_identity
@@ -146,6 +147,17 @@ def test_the_seam_never_retries_and_never_swallows(monkeypatch: pytest.MonkeyPat
         rank(build_rank_context(make_state()))
     assert raised.value is boom
     assert len(spy.runnable.invocations) == 1, "the ONE business retry lives in the rank node, not the seam"
+
+
+def test_an_explicit_api_key_is_passed_through_and_never_read_from_the_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ChatOpenAI reads OPENAI_API_KEY from os.environ only; a key that lives in Settings (.env) must be passed explicitly.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    spy = _spy(monkeypatch)
+    make_rank_model(model="gpt-4.1", prompts=local_prompts(), api_key="sk-test-not-real")
+    key = spy.constructed[0]["api_key"]
+    assert isinstance(key, SecretStr) and key.get_secret_value() == "sk-test-not-real"  # never a bare string
+    make_rank_model(model="gpt-4.1", prompts=local_prompts())
+    assert "api_key" not in spy.constructed[1]  # omitted: ChatOpenAI's own env lookup applies
 
 
 def test_the_timeout_can_be_overridden_but_defaults_to_the_fixed_one(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -25,7 +25,7 @@ from typing import Any, Protocol, cast
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 
 from eligibility_agent.config import OPENAI_TIMEOUT_S
 from eligibility_agent.derive.range import band_from_score
@@ -107,15 +107,23 @@ class RankModel(Protocol):
     def __call__(self, ctx: RankContext, *, config: RunnableConfig | None = None) -> ModelOutput: ...
 
 
-def make_rank_model(*, model: str, prompts: PromptBundle, timeout: float = OPENAI_TIMEOUT_S) -> RankModel:
+def make_rank_model(
+    *, model: str, prompts: PromptBundle, timeout: float = OPENAI_TIMEOUT_S, api_key: str | None = None
+) -> RankModel:
     """The production seam: ``ChatOpenAI`` (temperature 0, fixed timeout, ZERO SDK retries) with ``ModelOutput`` structured
-    output via ``function_calling``. Construction does no I/O (but needs ``OPENAI_API_KEY`` in the environment).
+    output via ``function_calling``. Construction does no I/O, but it needs a key: ``api_key`` when given (the app passes
+    ``Settings.openai_api_key``, which may come from a ``.env`` file ChatOpenAI never reads), else ``OPENAI_API_KEY`` from
+    the process environment (ChatOpenAI's own lookup).
 
     The returned callable makes exactly one model call per invocation, threads ``config`` through (so the LLM child run
     nests under the rank node's trace), and raises on anything that is not a ``ModelOutput``. It never retries and never
     swallows: the node owns the one retry and the ``OPENAI_FAILURE`` mapping.
     """
-    chat = ChatOpenAI(model=model, temperature=0, timeout=timeout, max_retries=0)
+    chat = (
+        ChatOpenAI(model=model, temperature=0, timeout=timeout, max_retries=0)
+        if api_key is None
+        else ChatOpenAI(model=model, temperature=0, timeout=timeout, max_retries=0, api_key=SecretStr(api_key))
+    )
     # langchain types the schema parameter as a bare ``type`` (partially unknown to pyright); the cast restores a known
     # type, and the isinstance check in ``_call`` is the real runtime guard.
     runnable = cast(
